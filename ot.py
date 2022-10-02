@@ -1,6 +1,7 @@
 import abc
 import contextlib
 import collections
+import os
 
 import trio
 from trio import socket
@@ -465,14 +466,45 @@ and it sees the edit is based on a dirty in-flight edit.
 
 PROTOCOL SUMMARY:
 
+Negotiation:
+
+    # EITHER
+
+        # new client connects
+        new:text\n
+        |   |
+        |   display name of this editor (not encoded!)
+        literal "new"
+
+        # server assigns editor id and reconnection secret
+        num:text:num:text\n
+        |   |    |   |
+        |   |    |   intial message content, encoded
+        |   |    initial server edit id
+        |   reconnection secret (not encoded!)
+        editor id
+
+    # OR
+
+        # client reconnects
+        old:num:text:...   # full semantics tbd
+        |   |   |
+        |   |   reconnection secret
+        |   assigned editor id
+        literal "old"
+
+        # server responds
+        ...
+
+
 Client messages:
 
     # edit submission message
-    s:num:num:text:char:num:num_or_text\n
-    | |   |   |    |    |   |
-    | |   |   |    |    |   OT arg, nchars or encoded text [1]
-    | |   |   |    |    OT idx
-    | |   |   |    OT type, "i"nsert or "delete
+    s:num:num:num:char:num:num_or_text\n
+    | |   |   |   |    |   |
+    | |   |   |   |    |   OT arg, nchars or encoded text [1]
+    | |   |   |   |    OT idx
+    | |   |   |   OT type, "i"nsert or "delete
     | |   |   parent edit author
     | |   parent edit id
     | edit id (edit author is assumed to be the submitting client)
@@ -571,7 +603,7 @@ class Insert(OT):
                 # other inserts after us
                 # INDEPENDENT
                 return self
-            elif other.idx == self.idx
+            elif other.idx == self.idx:
                 # other inserts at the same spot
                 # CONFLICT
                 return Insert(self.idx + len(other.text), self.text)
@@ -602,6 +634,16 @@ class Insert(OT):
     def inverse(self):
         return Delete(self.idx, len(self.text), self.text)
 
+    def __eq__(self, other):
+        return (
+            isinstance(other, Insert)
+            and self.idx == other.idx
+            and self.text == other.text
+        )
+
+    def __repr__(self):
+        return f"Insert({self.idx}, {repr(self.text)})"
+
 
 class Delete(OT):
     def __init__(self, idx, nchars, text):
@@ -615,7 +657,7 @@ class Delete(OT):
         self.text = text
 
     def apply(self, text):
-        return text[:self.idx] + text[self.idx + nchars:]
+        return text[:self.idx] + text[self.idx + self.nchars:]
 
     def inverse(self):
         assert self.text is not None, "non-invertible Delete"
@@ -677,47 +719,105 @@ class Delete(OT):
             f"{type(self).__name__}.after({type(other).__name__})"
         )
 
+    def __eq__(self, other):
+        return (
+            isinstance(other, Delete)
+            and self.idx == other.idx
+            and self.nchars == other.nchars
+        )
+
+    def __repr__(self):
+        return f"Delete({self.idx}, {self.nchars})"
+
+encoder = {
+    0: list(b"\\0"),  # "\0"
+    1: list(b"\\x01"),
+    2: list(b"\\x02"),
+    3: list(b"\\x03"),
+    4: list(b"\\x04"),
+    5: list(b"\\x05"),
+    6: list(b"\\x06"),
+    7: list(b"\\x07"),
+    8: list(b"\\b"),  # "\b"
+    9: list(b"\\t"),  # "\t"
+    10: list(b"\\n"),  # "\n"
+    11: list(b"\\x0b"),
+    12: list(b"\\x0c"),
+    13: list(b"\\r"),  # "\r"
+    14: list(b"\\x0e"),
+    15: list(b"\\x0f"),
+    16: list(b"\\x10"),
+    17: list(b"\\x11"),
+    18: list(b"\\x12"),
+    19: list(b"\\x13"),
+    20: list(b"\\x14"),
+    21: list(b"\\x15"),
+    22: list(b"\\x16"),
+    23: list(b"\\x17"),
+    24: list(b"\\x18"),
+    25: list(b"\\x19"),
+    26: list(b"\\x1a"),
+    27: list(b"\\x1b"),
+    28: list(b"\\x1c"),
+    29: list(b"\\x1d"),
+    30: list(b"\\x1e"),
+    31: list(b"\\x1f"),
+    92: list(b"\\\\"),  # "\\"
+    127: list(b"\\x7f"),
+}
+
+def encode_text(msg_byts):
+    out = []
+    for b in msg_byts:
+        e = encoder.get(b)
+        if e is not None:
+            out += e
+        else:
+            out.append(b)
+    return bytes(out)
+
+nibbles = {
+    48: 0, 49: 1, 50: 2, 51: 3, 52: 4,
+    53: 5, 54: 6, 55: 7, 56: 8, 57: 9,
+    65: 10, 66: 11, 67: 12, 68: 13, 69: 14, 70: 15,
+    97: 10, 98: 11, 99: 12, 100: 13, 101: 14, 102: 15,
+}
 
 def decode_text(wire_byts):
     out = []
     i = 0
+
     while i < len(wire_byts):
         c0 = wire_byts[i]; i += 1
         if c0 != 92:  # not "\"
-            out.append[c0]
+            out.append(c0)
             continue
         # "\" case
-        if i == len(wire_bytes):
+        if i == len(wire_byts):
             raise ValueError("unmatched '\\'")
         c1 = wire_byts[i]; i += 1
-        if c1 == 0:  # "\0"
-            out.append[0]
+        if c1 == 48:  # "\0"
+            out.append(0)
             continue
-        if c1 == 8:  # "\b"
-            out.append[8]
+        if c1 == 98:  # "\b"
+            out.append(8)
             continue
-        if c1 == 9:  # "\t"
-            out.append[9]
+        if c1 == 116:  # "\t"
+            out.append(9)
             continue
-        if c1 == 10:  # "\n"
-            out.append[10]
+        if c1 == 110:  # "\n"
+            out.append(10)
             continue
-        if c1 == 13:  # "\r"
-            out.append[13]
+        if c1 == 114:  # "\r"
+            out.append(13)
             continue
         if c1 != 120:  # not "x"
-            raise ValueError("unknown escape:", chr(c))
+            raise ValueError("unknown escape:", chr(c1))
         # "\x" case
         if i+1 >= len(wire_byts):
             raise ValueError("incomplete '\\x' escape")
         c2 = wire_byte[i]; i+= 1
         c3 = wire_byte[i]; i+= 1
-        nibbles = {
-            48: 0, 49: 1, 50: 2, 51: 3, 52: 4,
-            53: 5, 54: 6, 55: 7, 56: 8, 57: 9,
-            65: 10, 66: 11, 67: 12, 68: 13, 69: 14, 70: 15,
-            97: 10, 98: 11, 99: 12, 100: 13, 101: 14, 102: 15,
-        }
         try:
             out.append(16*nibbles[c2] + nibbles[c3])
         except Exception:
@@ -731,6 +831,14 @@ def decode_ot(typ_text, idx_text, arg_text):
         return Insert(int(idx_text), decode_text(arg_text))
     elif typ_text == b"d":
         return Delete(int(idx_text), int(arg_text))
+
+
+def encode_ot(ot):
+    """Serialize an OT for the wire."""
+    if isinstance(ot, Insert):
+        return b"i:%d:%s"%(ot.idx, encode_text(ot.text))
+    if isinstance(ot, Delete):
+        return b"d:%d:%d"%(ot.idx, ot.nchars)
 
 
 
@@ -798,45 +906,73 @@ def conflicts(a, b):
         return a.idx == b.idx
 
     if isinstance(a, Delete) and isinstance(b, Delete):
-        return a.idx + a.nchars >= b.idx or b.idx + b.nchars >= a.idx
+        if a.idx > b.idx:
+            a, b = b, a
+        return a.idx + a.nchars >= b.idx
 
     if isinstance(a, Insert):
         i, d = a, b
     else:
         i, d = b, a
 
-    return i.idx < d.idx or i.idx > d.idx + d.nchars
+    return i.idx >= d.idx and i.idx <= d.idx + d.nchars
 
 
 class SocketTransport:
-    def __init__(self, addr, on_connect, *, family=socket.AF_INET):
+    def __init__(self, addr, *, family=socket.AF_INET):
         self.addr = addr
-        self.on_connect = on_connect
-        self.hooks = hooks
         self.family = family
-        self.sock = None
+        self.edit_server = None
         # map connections to writable channel ends
         self.chans = {}
 
+    def set_edit_server(self, edit_server):
+        assert self.edit_server is None, "edit_server is already set!"
+        self.edit_server = edit_server
+
     async def acceptor(self, sock):
         while True:
-            conn = await l.accept()
-            print("conn", conn)
-            self.nursery.start_soon(negotiator, conn)
+            conn, _ = await sock.accept()
+            self.nursery.start_soon(self.negotiator, conn)
 
     async def negotiator(self, conn):
         # initial client negotiation
-        on_read = await self.on_connect(conn)
-        ... # TODO
+        buf = b""
+        while b"\n" not in buf:
+            byts = await conn.recv(4096)
+            if not byts:
+                print("connection broke before negotiation finished")
+                return
+            assert byts
+            buf += byts
+        line, buf = buf.split(b"\n", maxsplit=1)
+        cmd, rest = line.split(b":", maxsplit=1)
+        if cmd == b"new":
+            name = rest
+            print(f"new connection from {name}")
+            text = encode_text(self.edit_server.text)
+            # XXX: real author id
+            # XXX: real reconnection secret
+            edit_id = self.edit_server.edits[-1].id.id
+            await conn.send(b"%d:%s:%d:%s\n"%(1, b"secret", edit_id, text))
+        else:
+            raise ValueError(f"non-new negotiation detected: {line}")
+
         # start full-duplex OT streaming
+        await self.edit_server.on_connect(conn)
+
         w, r = trio.open_memory_channel(10)
         self.chans[conn] = w
-        self.nursery.start_soon(writer, conn, r)
-        self.nursery.start_soon(reader, conn, on_read)
+        self.nursery.start_soon(self.writer, conn, r)
+        if buf:
+            # feed leftover bytes before reading anything else
+            await self.edit_server.on_read(conn, buf)
+        self.nursery.start_soon(self.reader, conn)
+        # TODO: detect disconnects somehow
 
     async def writer(self, conn, chan):
         while True:
-            msg = await send_r.receive()
+            msg = await chan.receive()
             while msg:
                 n = await conn.send(msg)
                 msg = msg[n:]
@@ -844,42 +980,36 @@ class SocketTransport:
     async def write(self, conn, msg):
         await self.chans[conn].send(msg)
 
-    async def reader(self, conn, on_read):
-        buf = b""
+    async def reader(self, conn):
         while True:
             byts = await conn.recv(4096)
             # TODO: error handling, maybe like proxy.py::handle_conn()
             assert byts
-            buf += byts
-            lines = byts.split(b"\n")
-            for line in lines[:-1]:
-                await self.read_line(line)
-            buf = lines[-1]
-
-    async def read_line(line):
-        # Decode the message into an edit
-        # Apply the edit to the doc
-        #   - including any .after() logic
-        # Respond with just the edit ID to the author
-        #   - any .after()'s applied can be infered by the client
-        # Broadcast the whole edit to all other clients
+            await self.edit_server.on_read(conn, byts)
 
     async def run(self):
+        assert self.edit_server is not None, "edit server is not set"
         with socket.socket(self.family) as sock:
-            await sockw.bind(self.addr)
+            await sock.bind(self.addr)
             sock.listen()
-            with trio.CancelScope() as self.cancel_scope():
+            with trio.CancelScope() as self.cancel_scope:
                 async with trio.open_nursery() as self.nursery:
-                    nursery.start_soon(self.acceptor, sock)
+                    self.nursery.start_soon(self.acceptor, sock)
 
 
 class ID:
-    def __init__(self, id, editor):
+    def __init__(self, id: int, editor: int):
         self.id = id
         self.editor = editor
 
     def __eq__(self, other):
         return self.id == other.id and self.editor == other.editor
+
+    def __hash__(self):
+        return hash((self.id, self.editor))
+
+    def __repr__(self):
+        return f"ID({self.id}, {self.editor})"
 
 
 class Container:
@@ -911,12 +1041,15 @@ class Edit(Container):
         try:
             return cls(
                 id=ID(id=int(fields[0]), editor=editor),
-                parent=ID(id=int(fields[1]), editor=fields[2].decode('utf8')),
+                parent=ID(id=int(fields[1]), editor=int(fields[2])),
                 ot=decode_ot(fields[3], fields[4], fields[5]),
-                original_author=editor,
+                submitted_id=editor,
             )
         except Exception as e:
             raise ValueError("bad edit line", fields) from e
+
+    def __repr__(self):
+        return f"Edit({self.id}, {self.parent}, {self.submitted_id})"
 
 class EditMod(Container):
     """
@@ -925,6 +1058,9 @@ class EditMod(Container):
     def __init__(self, ot: OT, old: Edit):
         self.ot = ot
         self.old = old
+
+    def __repr__(self):
+        return f"EditMod({self.ot}, old={self.old})"
 
 
 class Shadow:
@@ -950,8 +1086,19 @@ class Shadow:
         # filter new edits which are in self.submissions already
         new_external_edits = [
             n for n in new_edits
-            if n.original_id not in self.submission_ids
+            if n.submitted_id not in self.submission_ids
         ]
+
+        # I'm pretty sure that either the last submission we emitted appears as
+        # first of the new_edits, or else new_edits should go unmodified.  The
+        # result is that new_external_edits is a consecutive string of edits,
+        # otherwise rebasing operations wouldn't make sense.
+        # XXX: if this holds true, simply the logic somehow
+        assert (
+            new_external_edits == new_edits
+            or new_external_edits == new_edits[1:]
+        ), (new_edits, new_external_edits)
+
         self.tail += [EditMod(n.ot, n) for n in new_external_edits]
 
         # edit is based on zero or more previous submissions:
@@ -971,7 +1118,7 @@ class Shadow:
         #                       edit - tail'
         #
         # keep tail' as our self.tail
-        # return edit' can apply to server_edits
+        # return edit' which can apply to server_edits
         # rebase many-onto-one, and one-onto-many as a by-product
         x = edit.ot
         for t in self.tail:
@@ -988,8 +1135,8 @@ class Shadow:
 
 
 class EditServer:
-    def __init__(self, write, text=b""):
-        self.write = write
+    def __init__(self, transport, text=b""):
+        self.transport = transport
         self.text = text
 
         self.conns = set()
@@ -1016,7 +1163,7 @@ class EditServer:
             first_edit = Edit(first_ot, first_id, base_id, "server")
             self.edits.append(first_edit)
 
-    def on_connect(self, conn):
+    async def on_connect(self, conn):
         # Make a defrag function to form lines from packets.
         buf = b""
 
@@ -1030,22 +1177,47 @@ class EditServer:
 
         self.conns.add(conn)
         self.defraggers[conn] = defrag
-        self.client_submissions[conn] = collections.deque()
+        self.shadows[conn] = Shadow(self.edits[-1].id)
 
-    def on_disconnect(self, conn):
+    async def on_disconnect(self, conn):
         self.conns.remove(conn)
         del self.defraggers[conn]
-        del self.client_submissions[conn]
+        del self.shadows[conn]
 
-    def on_read(byts, conn):
+    async def on_read(self, conn, byts):
         lines = self.defraggers[conn](byts)
 
         for line in lines:
             typ, body = line.split(b":", maxsplit=1)
             if typ == b"s":  # edit submission
-                # XXX: real author name
-                edit = Edit.from_line(body, "client")
-                self.on_submission(conn, edit)
+                # XXX: real author editor id
+                edit = Edit.from_line(body, 1)
+                # verify that the parent edit is sane
+                if edit.parent.editor == 0:
+                    # based on server history, must be based on a server
+                    # history newer than this
+                    if edit.parent.id >= len(self.edits):
+                        raise ValueError(
+                            f"editor {XXX} submitted edit based on "
+                            "non-existent parent submission"
+                        )
+                elif edit.parent.editor == 1:  # XXX real author id
+                    # based on a previous submission, must be the latest one
+                    shadow = self.shadows[conn]
+                    valid = None
+                    if shadow.submissions:
+                        valid = shadow.submissions[-1].id
+                    if not shadow.dirty and edit.parent.id != valid:
+                        raise ValueError(
+                            f"editor {XXX} submitted edit based on invalid "
+                            "parent submission (not the most recent one)"
+                        )
+                else:
+                    raise ValueError(
+                        f"editor {editor} submitted edit "
+                        f"based on peer {out.parent.id}"
+                    )
+                await self.on_submission(conn, edit)
             elif typ == b"k":  # acknowledge a server edit
                 ack_id = int(body)
                 # XXX: not sure, does dirty flag need recalculating?
@@ -1053,12 +1225,10 @@ class EditServer:
             else:
                 raise ValueError(f"unknown message type: {line}")
 
-    def on_submission(self, conn, edit):
-        # always send accept msg to authoring client
-        msg = b"a:%d\n"%edit.id.id
-        self.send_line(conn, msg)
-
-        if edit.parent.editor == "server":
+    def submission_atomic(self, conn, edit):
+        # "atomic" because no other coroutines may run during this function
+        # returns False if submission was rejected or came to nothing
+        if edit.parent.editor == 0:
             # start a new shadow history
             shadow = Shadow(edit.parent)
             self.shadows[conn] = shadow
@@ -1068,9 +1238,9 @@ class EditServer:
         new_edits = self.edits[shadow.last_known_id.id+1:]
         ot = shadow.new_submission(edit, new_edits)
 
-        if ot None:
+        if ot is None:
             # submission was rejected or came out to nothing
-            return
+            return None, None
 
         # apply submission to server history and broacast it
         new_id = len(self.edits)
@@ -1079,13 +1249,37 @@ class EditServer:
                 ot=ot,
                 id=ID(new_id, "server"),
                 parent=ID(new_id-1, "server"),
-                original_author=edit.original_author,
+                submitted_id=edit.submitted_id,
             )
         )
+        self.text = ot.apply(self.text)
+        return new_id, ot
+
+    async def on_submission(self, conn, edit):
+        new_id, ot = self.submission_atomic(conn, edit)
+
+        # always send accept msg to authoring client
+        msg = b"a:%d\n"%edit.id.id
+        await self.transport.write(conn, msg)
+
+        if ot is None:
+            return
 
         # broadcast to all non-authoring clients
         msg = b"x:%d:%s\n"%(new_id, encode_ot(ot))
         for c in self.conns:
             if c == conn:
                 continue
-            self.send_line(c, msg)
+            await self.transport.write(c, msg)
+
+
+if __name__ == "__main__":
+    socketpath = "./asdf"
+    transport = SocketTransport(addr=socketpath, family=socket.AF_UNIX)
+    edit_server = EditServer(transport)
+    transport.set_edit_server(edit_server)
+
+    try:
+        trio.run(transport.run)
+    finally:
+        os.unlink(socketpath)
