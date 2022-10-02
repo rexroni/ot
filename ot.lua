@@ -172,9 +172,9 @@ function Client:create()
     c.leftovers = ""
     c.listen_state = nil
 
-    c.editor_id = nil
-    c.edit_id = 0
-    c.latest_server_edit = 0
+    c.author_id = nil
+    c.edit_seq = 0
+    c.latest_server_seq = 0
     c.in_flight = {}
 
     -- our own undoable history
@@ -315,7 +315,7 @@ function Client:on_line(line)
     if c.listen_state == "negotiate" then
         -- parse the server response
         local fields = split(line, ":", 3)
-        c.editor_id = tonumber(fields[1])
+        c.author_id = tonumber(fields[1])
         c.reconnect_secret = decode(fields[2])
         -- TODO: deal with text now that we have it
         local text = decode(fields[3])
@@ -327,18 +327,18 @@ function Client:on_line(line)
         if t[1] == "x" then
             -- e"x"ternal edit
             local x = split(t[2], ":", 4)
-            c.edit_id = tonumber(x[1])
+            c.edit_seq = tonumber(x[1])
             if x[2] == "i" then
-                c:on_external_insert(edit_id, tonumber(x[3]), decode(x[4]))
+                c:on_external_insert(edit_seq, tonumber(x[3]), decode(x[4]))
             elseif x[2] == "d" then
-                c:on_external_delete(edit_id, tonumber(x[3]), tonumber(x[4]))
+                c:on_external_delete(edit_seq, tonumber(x[3]), tonumber(x[4]))
             else
                 error(string.format("unrecognized edit type: %s", line))
             end
         elseif t[1] == "a" then
             -- "a"ccepted message
-            edit_id = tonumber(t[2])
-            c:on_accept(edit_id)
+            edit_seq = tonumber(t[2])
+            c:on_accept(edit_seq)
         else
             error(string.format("unrecognized line: %s", line))
         end
@@ -348,15 +348,15 @@ function Client:on_line(line)
     end
 end
 
-function Client:on_external_insert(edit_id, idx, text)
+function Client:on_external_insert(edit_seq, idx, text)
     error("on_external_insert")
 end
 
-function Client:on_external_delete(edit_id, idx, count)
+function Client:on_external_delete(edit_seq, idx, count)
     error("on_external_delete")
 end
 
-function Client:on_accept(edit_id)
+function Client:on_accept(edit_seq)
     error("on_accept")
 end
 
@@ -372,19 +372,19 @@ function Client:write_edit_direct(typ, idx, arg)
     else
         error(string.format("unknown write_edit type: %s", typ))
     end
-    local parent_edit_id = nil
-    local parent_editor = nil
+    local parent_seq = nil
+    local parent_author = nil
     if #c.in_flight > 0 then
-        parent_edit_id = c.edit_id
-        parent_editor = c.editor_id
+        parent_seq = c.edit_seq
+        parent_author = c.author_id
     else
-        parent_edit_id = c.latest_server_edit
-        parent_editor = 0  -- server editor id
+        parent_seq = c.latest_server_seq
+        parent_author = 0  -- server author id
     end
-    c.edit_id = c.edit_id + 1
+    c.edit_seq = c.edit_seq + 1
     local msg = string.format(
         "s:%d:%d:%d:%s:%d:%s\n",
-        c.edit_id, parent_edit_id, parent_editor, typ, idx, arg
+        c.edit_seq, parent_seq, parent_author, typ, idx, arg
     )
     assert(c.pipe:write(msg, c.on_write))
     -- keep track of which edits we have in flight

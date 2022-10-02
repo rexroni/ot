@@ -473,16 +473,16 @@ Negotiation:
         # new client connects
         new:text\n
         |   |
-        |   display name of this editor (not encoded!)
+        |   display name of this author (not encoded!)
         literal "new"
 
-        # server assigns editor id and reconnection secret
+        # server assigns author id and reconnection secret
         num:text:num:text\n
         |   |    |   |
         |   |    |   intial message content, encoded
-        |   |    initial server edit id
+        |   |    initial server edit sequence number
         |   reconnection secret (not encoded!)
-        editor id
+        author id
 
     # OR
 
@@ -490,7 +490,7 @@ Negotiation:
         old:num:text:...   # full semantics tbd
         |   |   |
         |   |   reconnection secret
-        |   assigned editor id
+        |   assigned author id
         literal "old"
 
         # server responds
@@ -505,9 +505,9 @@ Client messages:
     | |   |   |   |    |   OT arg, nchars or encoded text [1]
     | |   |   |   |    OT idx
     | |   |   |   OT type, "i"nsert or "delete
-    | |   |   parent edit author
-    | |   parent edit id
-    | edit id (edit author is assumed to be the submitting client)
+    | |   |   parent edit's author
+    | |   parent edit's sequence number
+    | edit sequence number (edit author is assumed to be the submitting client)
     edit "s"ubmission
 
     [1] Insert.text encoding
@@ -529,7 +529,7 @@ Client messages:
     # acknowledge message
     k:num\n
     | |
-    | edit id (the edit author of "server" is implied)
+    | edit sequence number (the edit author of server=0 is implied)
     ac"k"nowlegde
 
 Server messages:
@@ -540,13 +540,13 @@ Server messages:
     | |   |    |   OT arg, nchars or encoded text [1]
     | |   |    OT idx
     | |   OT type, "i"nsert or "delete
-    | edit id (the edit author of "server" is implied)
+    | edit sequence number (the edit author of server=0 is implied)
     e"x"ternal edit
 
     # accepted edit message
     a:num\n
     | |
-    | edit id (edit author of this client is implied)
+    | edit sequence number (edit author of this client is implied)
     "a"ccepted
 
 """
@@ -953,8 +953,8 @@ class SocketTransport:
             text = encode_text(self.edit_server.text)
             # XXX: real author id
             # XXX: real reconnection secret
-            edit_id = self.edit_server.edits[-1].id.id
-            await conn.send(b"%d:%s:%d:%s\n"%(1, b"secret", edit_id, text))
+            latest_seq = self.edit_server.edits[-1].id.seq
+            await conn.send(b"%d:%s:%d:%s\n"%(1, b"secret", latest_seq, text))
         else:
             raise ValueError(f"non-new negotiation detected: {line}")
 
@@ -998,18 +998,18 @@ class SocketTransport:
 
 
 class ID:
-    def __init__(self, id: int, editor: int):
-        self.id = id
-        self.editor = editor
+    def __init__(self, seq: int, author: int):
+        self.seq = seq
+        self.author = author
 
     def __eq__(self, other):
-        return self.id == other.id and self.editor == other.editor
+        return self.seq == other.seq and self.author == other.author
 
     def __hash__(self):
-        return hash((self.id, self.editor))
+        return hash((self.seq, self.author))
 
     def __repr__(self):
-        return f"ID({self.id}, {self.editor})"
+        return f"ID({self.seq}, {self.author})"
 
 
 class Container:
@@ -1020,30 +1020,31 @@ class Edit(Container):
     """
     Serializable container around an OT with a pointer to a parent.
     """
-    def __init__(self, ot, id: ID, parent: ID, submitted_id):
+    def __init__(self, ot, id: ID, parent: ID, submitted_id: ID):
         self.ot = ot
         self.id = id
         self.parent = parent
         self.submitted_id = submitted_id
 
     @classmethod
-    def from_line(cls, text, editor):
+    def from_line(cls, text, author):
         """
         Decode an edit from a colon-separated list of fields:
-          - 0: ID.id
-          - 1: Parent ID.id
-          - 2: Parent ID.editor
+          - 0: ID.seq
+          - 1: Parent ID.seq
+          - 2: Parent ID.author
           - 3: OT type ("i" or "d")
           - 4: OT idx
           - 5: OT arg
         """
         fields = text.split(b":", maxsplit=5)
         try:
+            id = ID(seq=int(fields[0]), author=author)
             return cls(
-                id=ID(id=int(fields[0]), editor=editor),
-                parent=ID(id=int(fields[1]), editor=int(fields[2])),
+                id=id,
+                parent=ID(seq=int(fields[1]), author=int(fields[2])),
                 ot=decode_ot(fields[3], fields[4], fields[5]),
-                submitted_id=editor,
+                submitted_id=id,
             )
         except Exception as e:
             raise ValueError("bad edit line", fields) from e
@@ -1153,14 +1154,14 @@ class EditServer:
 
         # base edit is always a noop, and is its own parent
         base_ot = Insert(0, b"")
-        base_id = ID(0, "server")
-        base_edit = Edit(base_ot, base_id, base_id, "server")
+        base_id = ID(0, 0)
+        base_edit = Edit(base_ot, base_id, base_id, base_id)
         self.edits.append(base_edit)
 
         if text:
             first_ot = Insert(0, text)
-            first_id = ID(1, "server")
-            first_edit = Edit(first_ot, first_id, base_id, "server")
+            first_id = ID(1, 0)
+            first_edit = Edit(first_ot, first_id, base_id, first_id)
             self.edits.append(first_edit)
 
     async def on_connect(self, conn):
@@ -1190,32 +1191,32 @@ class EditServer:
         for line in lines:
             typ, body = line.split(b":", maxsplit=1)
             if typ == b"s":  # edit submission
-                # XXX: real author editor id
+                # XXX: real author
                 edit = Edit.from_line(body, 1)
                 # verify that the parent edit is sane
-                if edit.parent.editor == 0:
+                if edit.parent.author == 0:
                     # based on server history, must be based on a server
                     # history newer than this
-                    if edit.parent.id >= len(self.edits):
+                    if edit.parent.seq >= len(self.edits):
                         raise ValueError(
-                            f"editor {XXX} submitted edit based on "
+                            f"author {XXX} submitted edit based on "
                             "non-existent parent submission"
                         )
-                elif edit.parent.editor == 1:  # XXX real author id
+                elif edit.parent.author == 1:  # XXX real author id
                     # based on a previous submission, must be the latest one
                     shadow = self.shadows[conn]
                     valid = None
                     if shadow.submissions:
-                        valid = shadow.submissions[-1].id
-                    if not shadow.dirty and edit.parent.id != valid:
+                        valid = shadow.submissions[-1].seq
+                    if not shadow.dirty and edit.parent.seq != valid:
                         raise ValueError(
-                            f"editor {XXX} submitted edit based on invalid "
+                            f"author {XXX} submitted edit based on invalid "
                             "parent submission (not the most recent one)"
                         )
                 else:
                     raise ValueError(
-                        f"editor {editor} submitted edit "
-                        f"based on peer {out.parent.id}"
+                        f"author {author} submitted edit "
+                        f"based on peer {out.parent.author}"
                     )
                 await self.on_submission(conn, edit)
             elif typ == b"k":  # acknowledge a server edit
@@ -1228,14 +1229,14 @@ class EditServer:
     def submission_atomic(self, conn, edit):
         # "atomic" because no other coroutines may run during this function
         # returns False if submission was rejected or came to nothing
-        if edit.parent.editor == 0:
+        if edit.parent.author == 0:
             # start a new shadow history
             shadow = Shadow(edit.parent)
             self.shadows[conn] = shadow
         else:
             shadow = self.shadows[conn]
 
-        new_edits = self.edits[shadow.last_known_id.id+1:]
+        new_edits = self.edits[shadow.last_known_id.seq+1:]
         ot = shadow.new_submission(edit, new_edits)
 
         if ot is None:
@@ -1243,30 +1244,30 @@ class EditServer:
             return None, None
 
         # apply submission to server history and broacast it
-        new_id = len(self.edits)
+        new_seq = len(self.edits)
         self.edits.append(
             Edit(
                 ot=ot,
-                id=ID(new_id, "server"),
-                parent=ID(new_id-1, "server"),
+                id=ID(new_seq, "server"),
+                parent=ID(new_seq-1, "server"),
                 submitted_id=edit.submitted_id,
             )
         )
         self.text = ot.apply(self.text)
-        return new_id, ot
+        return new_seq, ot
 
     async def on_submission(self, conn, edit):
-        new_id, ot = self.submission_atomic(conn, edit)
+        new_seq, ot = self.submission_atomic(conn, edit)
 
         # always send accept msg to authoring client
-        msg = b"a:%d\n"%edit.id.id
+        msg = b"a:%d\n"%edit.id.seq
         await self.transport.write(conn, msg)
 
         if ot is None:
             return
 
         # broadcast to all non-authoring clients
-        msg = b"x:%d:%s\n"%(new_id, encode_ot(ot))
+        msg = b"x:%d:%s\n"%(new_seq, encode_ot(ot))
         for c in self.conns:
             if c == conn:
                 continue
