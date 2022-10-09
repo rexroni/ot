@@ -111,6 +111,142 @@ def test_conflicts():
     assert ot.conflicts(ot.Delete(5, 6, None), ot.Delete(11, 1, None))
 
 
+def test_shadow():
+    """
+    Testing the example histories from the protocol description:
+
+        a - b - x' - c - d - y' - e   # real history
+
+        a - x - y - b' - c' - d' - e  # shadow history
+    """
+    def ids(author):
+        val = 0
+        while True:
+            yield ot.ID(val, author)
+            val += 1
+
+    srv_ids = ids(0)
+    cli_ids = ids(1)
+
+    def applyall(*edits):
+        text = b""
+        for edit in edits:
+            text = edit.ot.apply(text)
+        return text
+
+    base_id = next(srv_ids)
+    a = ot.Edit(
+        ot=ot.Insert(0, b"hello world"),
+        id=base_id,
+        parent=base_id,
+    )
+
+    shadow = ot.Shadow(a.id)
+
+    # external edit b is simultaneous with new submission x
+    b = ot.Edit(
+        ot=ot.Insert(6, b"bb "),
+        id=next(srv_ids),
+        parent=a.id,
+    )
+    x = ot.Edit(
+        ot=ot.Insert(11, b"x"),
+        id=next(cli_ids),
+        parent=a.id,
+    )
+    xp_ot = shadow.new_submission(x, [b])
+    bp_ot = b.ot.after(x.ot)
+
+    assert xp_ot == ot.Insert(14, b"x"), xp_ot
+    assert len(shadow.tail) == 1, shadow.tail
+    assert shadow.tail[0].ot == ot.Insert(6, b"bb "), shadow.tail
+    assert (t := applyall(a, b)) == b"hello bb world", t
+    assert (t := applyall(a, x)) == b"hello worldx", t
+
+    # xp would land after b
+    xp = ot.Edit(
+        ot=xp_ot,
+        id=next(srv_ids),
+        parent=b.id,
+        submitted_id=x.id,
+    )
+    t1 = applyall(a, *shadow.submissions, *shadow.tail)
+    t2 = applyall(a, b, xp)
+    assert t1 == t2 == b"hello bb worldx", (t1, t2)
+
+    # external edits c and d are simultaneous with new submission y
+    c = ot.Edit(
+        ot=ot.Insert(9, b"ccc "),
+        id=next(srv_ids),
+        parent=xp.id,
+    )
+    d = ot.Edit(
+        ot=ot.Insert(13, b"dddd "),
+        id=next(srv_ids),
+        parent=c.id,
+    )
+    y = ot.Edit(
+        ot=ot.Insert(0, b"yy"),
+        id=next(cli_ids),
+        parent=x.id,
+    )
+    yp_ot = shadow.new_submission(y, [xp, c, d])
+
+    assert yp_ot == ot.Insert(0, b"yy"), yp_ot
+    assert len(shadow.tail) == 3, shadow.tail
+    assert shadow.tail[0].ot == ot.Insert(8, b"bb "), shadow.tail
+    assert shadow.tail[1].ot == ot.Insert(11, b"ccc "), shadow.tail
+    assert shadow.tail[2].ot == ot.Insert(15, b"dddd "), shadow.tail
+    assert (t := applyall(a, b, xp, c, d)) == b"hello bb ccc dddd worldx", t
+    assert (t := applyall(a, x, y)) == b"yyhello worldx", t
+
+    # yp would land after d
+    yp = ot.Edit(
+        ot=yp_ot,
+        id=next(srv_ids),
+        parent=d.id,
+        submitted_id=y.id,
+    )
+    t1 = applyall(a, *shadow.submissions, *shadow.tail)
+    t2 = applyall(a, b, xp, c, d, yp)
+    assert t1 == t2 == b"yyhello bb ccc dddd worldx", (t1, t2)
+
+    # external edit e is simultaneous with z
+    e = ot.Edit(
+        ot=ot.Insert(20, b"eeeee "),
+        id=next(srv_ids),
+        parent=yp.id,
+    )
+    z = ot.Edit(
+        ot=ot.Insert(14, b"zzz"),
+        id=next(cli_ids),
+        parent=y.id,
+    )
+    zp_ot = shadow.new_submission(z, [yp, e])
+
+    assert zp_ot == ot.Insert(32, b"zzz"), zp_ot
+    assert len(shadow.tail) == 4, shadow.tail
+    assert shadow.tail[0].ot == ot.Insert(8, b"bb "), shadow.tail
+    assert shadow.tail[1].ot == ot.Insert(11, b"ccc "), shadow.tail
+    assert shadow.tail[2].ot == ot.Insert(15, b"dddd "), shadow.tail
+    assert shadow.tail[3].ot == ot.Insert(20, b"eeeee "), shadow.tail
+    t = applyall(a, b, xp, c, d, yp, e)
+    assert t == b"yyhello bb ccc dddd eeeee worldx", t
+    assert (t := applyall(a, x, y, z)) == b"yyhello worldxzzz", t
+
+    # zp would land after e
+    zp = ot.Edit(
+        ot=zp_ot,
+        id=next(srv_ids),
+        parent=d.id,
+        submitted_id=z.id,
+    )
+    t1 = applyall(a, *shadow.submissions, *shadow.tail)
+    t2 = applyall(a, b, xp, c, d, yp, e, zp)
+    assert t1 == t2 == b"yyhello bb ccc dddd eeeee worldxzzz", (t1, t2)
+    # TODO: support (and test) client-side acks
+
+
 class LineBuffer:
     def __init__(self, sock):
         self.sock = sock
@@ -149,6 +285,7 @@ if __name__ == "__main__":
     test_insert()
     test_delete()
     test_conflicts()
+    test_shadow()
 
     # e2e tests
     socketpath = "./asdf"
@@ -171,6 +308,7 @@ if __name__ == "__main__":
                 sock.connect(socketpath)
                 break
             except:
+                sock.close()
                 time.sleep(0.01)
         else:
             raise ValueError("failed to connect within 300ms")

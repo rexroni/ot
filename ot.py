@@ -595,7 +595,7 @@ class Insert(OT):
         self.text = text
 
     def apply(self, text):
-        return text[:self.idx] + self.text +  text[self.idx:]
+        return text[:self.idx] + self.text + text[self.idx:]
 
     def after(self, other):
         if isinstance(other, Insert):
@@ -1020,11 +1020,11 @@ class Edit(Container):
     """
     Serializable container around an OT with a pointer to a parent.
     """
-    def __init__(self, ot, id: ID, parent: ID, submitted_id: ID):
+    def __init__(self, ot, id: ID, parent: ID, submitted_id: ID = None):
         self.ot = ot
         self.id = id
         self.parent = parent
-        self.submitted_id = submitted_id
+        self.submitted_id = submitted_id if submitted_id is not None else id
 
     @classmethod
     def from_line(cls, text, author):
@@ -1155,13 +1155,13 @@ class EditServer:
         # base edit is always a noop, and is its own parent
         base_ot = Insert(0, b"")
         base_id = ID(0, 0)
-        base_edit = Edit(base_ot, base_id, base_id, base_id)
+        base_edit = Edit(base_ot, base_id, base_id)
         self.edits.append(base_edit)
 
         if text:
             first_ot = Insert(0, text)
             first_id = ID(1, 0)
-            first_edit = Edit(first_ot, first_id, base_id, first_id)
+            first_edit = Edit(first_ot, first_id, base_id)
             self.edits.append(first_edit)
 
     async def on_connect(self, conn):
