@@ -9,6 +9,28 @@ import trio
 import ot
 
 
+def test_encode_decode():
+    base = bytes([*range(128)])
+    expect = (
+        b"\\0"
+        b"\\x01\\x02\\x03\\x04\\x05\\x06\\x07"
+        b"\\b\\t\\n"
+        b"\\x0b\\x0c"
+        b"\\r"
+        b"\\x0e\\x0f\\x10\\x11\\x12\\x13\\x14\\x15\\x16"
+        b"\\x17\\x18\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f"
+        b" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ["
+        b"\\\\"
+        b"]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+        b"\\x7f"
+    )
+    encoded = ot.encode_text(base)
+    assert encoded == expect, '\n' + repr(encoded) + '\n' + repr(expect)
+
+    decoded = ot.decode_text(encoded)
+    assert decoded == base, '\n' + repr(decoded) + '\n' + repr(base)
+
+
 def test_insert():
     # .apply() tests
     result = ot.Insert(0, b"hello ").apply(b"world")
@@ -282,6 +304,7 @@ def first_connection(sock, es):
 
 if __name__ == "__main__":
     # unit tests
+    test_encode_decode()
     test_insert()
     test_delete()
     test_conflicts()

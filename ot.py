@@ -799,6 +799,9 @@ def decode_text(wire_byts):
         if c1 == 48:  # "\0"
             out.append(0)
             continue
+        if c1 == 92:  # "\\"
+            out.append(92)
+            continue
         if c1 == 98:  # "\b"
             out.append(8)
             continue
@@ -816,8 +819,8 @@ def decode_text(wire_byts):
         # "\x" case
         if i+1 >= len(wire_byts):
             raise ValueError("incomplete '\\x' escape")
-        c2 = wire_byte[i]; i+= 1
-        c3 = wire_byte[i]; i+= 1
+        c2 = wire_byts[i]; i+= 1
+        c3 = wire_byts[i]; i+= 1
         try:
             out.append(16*nibbles[c2] + nibbles[c3])
         except Exception:
