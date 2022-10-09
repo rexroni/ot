@@ -7,11 +7,17 @@ uv = require "luv"
 function nvim_printf(format, ...)
     msg = string.format(format, ...)
     cmd = string.format('echo "%s"', msg)
-    vim.schedule(function()
-        vim.api.nvim_command('echoh ErrorMsg')
-        vim.api.nvim_command(cmd)
-        vim.api.nvim_command('echoh None')
-    end)
+    if vim ~= nil then
+        -- plugin execution
+        vim.schedule(function()
+            vim.api.nvim_command('echoh ErrorMsg')
+            vim.api.nvim_command(cmd)
+            vim.api.nvim_command('echoh None')
+        end)
+    else
+        -- test execution
+        print(cmd)
+    end
 end
 
 function encode(s)
@@ -34,7 +40,7 @@ function encode(s)
             c = "\\0"
         else
             -- control character
-            c = string.format("\\%.2x", n)
+            c = string.format("\\x%.2x", n)
         end
         table.insert(t, c)
     end
@@ -79,7 +85,7 @@ function decode(s)
                 elseif c == "0" then
                     c = "\0"
                 else
-                    error("bad escape")
+                    error("bad escape: " .. c)
                 end
                 table.insert(t, c)
                 state = 0
@@ -403,27 +409,30 @@ function Client:write_edit(typ, idx, arg)
     end
 end
 
-c = Client:create()
+if vim ~= nil then
+    -- plugin execution
+    c = Client:create()
 
-function on_bytes(x, buf, tick, sr, sc, s, oer, oec, ol, ner, nec, nl)
-    -- broadcast operational transforms to the server
-    -- important args are s (start), ol (old len), and nl (new len)
-    if ol > 0 then
-        -- emit a deletion
-        c:write_edit("d", s, ol)
-    end
-    if nl > 0 then
-        -- emit an insertion
-        if ner == 0 then
-            -- when on the same line, nec is relative
-            nec = sc + nec
+    function on_bytes(x, buf, tick, sr, sc, s, oer, oec, ol, ner, nec, nl)
+        -- broadcast operational transforms to the server
+        -- important args are s (start), ol (old len), and nl (new len)
+        if ol > 0 then
+            -- emit a deletion
+            c:write_edit("d", s, ol)
         end
-        -- ner is always relative
-        ner = sr + ner
-        text = vim.api.nvim_buf_get_text(buf, sr, sc, ner, nec, {})
-        text = table.concat(text, "\n")
-        c:write_edit("i", s, text)
+        if nl > 0 then
+            -- emit an insertion
+            if ner == 0 then
+                -- when on the same line, nec is relative
+                nec = sc + nec
+            end
+            -- ner is always relative
+            ner = sr + ner
+            text = vim.api.nvim_buf_get_text(buf, sr, sc, ner, nec, {})
+            text = table.concat(text, "\n")
+            c:write_edit("i", s, text)
+        end
     end
-end
 
-vim.api.nvim_buf_attach(0, false, {on_bytes=on_bytes})
+    vim.api.nvim_buf_attach(0, false, {on_bytes=on_bytes})
+end
