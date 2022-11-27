@@ -298,8 +298,10 @@ def first_connection(sock, es):
     assert lb.readline() == b"a:0", lb.last
     assert es.text == b"hello world\n", es.text
     sock.send(b"s:1:1:0:i:6:cruel \n")
+    sock.send(b"s:2:1:1:i:11:-ass\n")
     assert lb.readline() == b"a:1", lb.last
-    assert es.text == b"hello cruel world\n", es.text
+    assert lb.readline() == b"a:2", lb.last
+    assert es.text == b"hello cruel-ass world\n", es.text
 
 
 if __name__ == "__main__":
@@ -344,4 +346,3 @@ if __name__ == "__main__":
 
     finally:
         os.unlink(socketpath)
-

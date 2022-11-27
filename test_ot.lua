@@ -3,14 +3,14 @@ require "string"
 
 require "ot"
 
-function test_encode_decode()
-    t = {}
+local function test_encode_decode()
+    local t = {}
     for i=0, 127 do
         table.insert(t, string.char(i))
     end
-    base = table.concat(t, "")
+    local base = table.concat(t, "")
 
-    expect = ""
+    local expect = ""
         .. "\\0"
         .. "\\x01\\x02\\x03\\x04\\x05\\x06\\x07"
         .. "\\b\\t\\n"
@@ -23,14 +23,14 @@ function test_encode_decode()
         .. "]^_`abcdefghijklmnopqrstuvwxyz{|}~"
         .. "\\x7f"
 
-    encoded = encode(base)
+    local encoded = ot.encode(base)
     if encoded ~= expect then
         print(encoded)
         print(expect)
         error("encoded != expect")
     end
 
-    decoded = decode(encoded)
+    local decoded = ot.decode(encoded)
     if decoded ~= base then
         print(decoded)
         print(base)

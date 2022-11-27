@@ -987,7 +987,9 @@ class SocketTransport:
         while True:
             byts = await conn.recv(4096)
             # TODO: error handling, maybe like proxy.py::handle_conn()
-            assert byts
+            with open("log", "a") as f:
+                f.write(f"ot.py read bytes: {byts}\n")
+            assert byts, byts
             await self.edit_server.on_read(conn, byts)
 
     async def run(self):
@@ -1210,7 +1212,7 @@ class EditServer:
                     shadow = self.shadows[conn]
                     valid = None
                     if shadow.submissions:
-                        valid = shadow.submissions[-1].seq
+                        valid = shadow.submissions[-1].id.seq
                     if not shadow.dirty and edit.parent.seq != valid:
                         raise ValueError(
                             f"author {XXX} submitted edit based on invalid "

@@ -2,12 +2,13 @@ require "io"
 require "os"
 require "string"
 require "table"
+require "math"
 uv = require "luv"
 
-function nvim_printf(format, ...)
-    msg = string.format(format, ...)
-    cmd = string.format('echo "%s"', msg)
-    if vim ~= nil then
+local function nvim_printf(format, ...) --> nil
+    local msg = string.format(format, ...)
+    local cmd = string.format('echo "%s"', msg)
+    if vim then
         -- plugin execution
         vim.schedule(function()
             vim.api.nvim_command('echoh ErrorMsg')
@@ -20,7 +21,14 @@ function nvim_printf(format, ...)
     end
 end
 
-function encode(s)
+local function log_printf(format, ...) --> nil
+    local msg = string.format(format, ...)
+    local f = io.open("log", "a")
+    f:write(msg)
+    f:close()
+end
+
+local function encode(s) --> string
     t = {}
     for c in string.gmatch(s, ".") do
         n = string.byte(c)
@@ -47,14 +55,14 @@ function encode(s)
     return table.concat(t, "")
 end
 
-nibbles = {
-    ["0"]= 0, ["1"]= 1, ["2"]= 2, ["3"]= 3, ["4"]= 4,
-    ["5"]= 5, ["6"]= 6, ["7"]= 7, ["8"]= 8, ["9"]= 9,
-    a= 10, b= 11, c= 12, d= 13, e= 14, f= 15,
-    A= 10, B= 11, C= 12, D= 13, E= 14, F= 15,
+local nibbles = {
+    ["0"] = 0, ["1"] = 1, ["2"] = 2, ["3"] = 3, ["4"] = 4,
+    ["5"] = 5, ["6"] = 6, ["7"] = 7, ["8"] = 8, ["9"] = 9,
+    a = 10, b = 11, c = 12, d = 13, e = 14, f = 15,
+    A = 10, B = 11, C = 12, D = 13, E = 14, F = 15,
 }
 
-function decode(s)
+local function decode(s) --> string
     t = {}
     state = 0 -- 1: after '\'; 2: after '\x'; 3: after '\xN'
     high = nil
@@ -110,315 +118,540 @@ function decode(s)
     return table.concat(t, "")
 end
 
--- expect exactly n splits
-function split(s, c, n)
-    out = {}
-    start = 1
-    while #out + 1 < n do
-        idx = string.find(s, c, start)
-        if idx == nil then
-            error("not enough fields to split")
+local function addrspec_connect(addrspec, on_connect) --> (conn|nil, err)
+    local host, port, ok, conn, err
+    -- detect a plain port
+    local port = tonumber(addrspec)
+    if port then
+        conn, err = uv.new_tcp()
+        if not conn then
+            return nil, err
         end
-        table.insert(out, string.sub(s, start, idx-1))
-        start = idx + 1
-    end
-    -- the last field is just whatever's left
-    table.insert(out, string.sub(s, start))
-    return out
-end
-
--- up to n splits, where n is optional
-function split_soft(s, c, n)
-    out = {}
-    start = 1
-    while n == nil or #out + 1 < n do
-        idx = string.find(s, c, start)
-        if idx == nil then
-            break
-        end
-        table.insert(out, string.sub(s, start, idx-1))
-        start = idx + 1
-    end
-    -- the last field is just whatever's left
-    table.insert(out, string.sub(s, start))
-    return out
-end
-
-
-Client = {}
-Client.__index = Client
-
-function Client:create()
-    local c = {}
-    setmetatable(c, Client)
-
-    -- luv callbacks need to be bound functions, with special error handling
-    local function uv_method(n)
-        return function(...)
-            local ok
-            local msg
-            ok, msg = pcall(Client[n], c, ...)
-            if not ok then
-                c:fail(msg)
-            end
-        end
-    end
-    c.on_connect = uv_method("on_connect")
-    c.on_close = uv_method("on_close")
-    c.on_read = uv_method("on_read")
-    c.on_write = uv_method("on_write")
-
-    c.pipe = uv.new_pipe(false)
-    assert(c.pipe)
-
-    -- when we aren't connected, we queue up edits we would like to make
-    c.write_q = {}
-
-    c.failed = false
-    c.leftovers = ""
-    c.listen_state = nil
-
-    c.author_id = nil
-    c.edit_seq = 0
-    c.latest_server_seq = 0
-    c.in_flight = {}
-
-    -- our own undoable history
-    c.history = {}
-
-    -- state machine data
-    c.connected = false
-    c.negotiate = {sent=false, recvd=false, done=false}
-    c.closed = false
-
-    -- start trying to connect
-    assert(c.pipe:connect("./asdf", c.on_connect))
-
-    return c
-end
-
--- when we hit an error, we have to shut down gracefully
-function Client:fail(msg)
-    local c = self
-    if not c.failed then
-        nvim_printf('giving up on doc sync: %s', msg)
-        -- start shutting down
-        c.failed = true
-        local ok
-        local msg
-        ok, msg = pcall(Client.advance_state, c)
+        ok, err = conn:connect("localhost", port, on_connect)
         if not ok then
-            c:fail(msg)
+            conn:close()
+            return nil, err
         end
-    else
-        -- failure while handling failiures
-        nvim_printf('failed while giving up: %s', msg)
+        return conn, nil
+    end
+
+    -- detect host:port
+    local idx = string.find(addrspec, ":")
+    if idx then
+        host = string.sub(addrspec, 1, idx-1)
+        port = string.sub(addrspec, idx+1, #addrspec)
+        conn, err = uv.new_tcp()
+        if not conn then
+            return nil, err
+        end
+        ok, err = conn:connect(host, port, on_connect)
+        if not ok then
+            conn:close()
+            return nil, err
+        end
+        return conn, nil
+    end
+
+    -- detect path
+    idx = string.find(addrspec, "/")
+    if idx then
+        conn, err = uv.new_pipe(false)
+        if not conn then
+            return nil, err
+        end
+        ok, err = conn:connect(addrspec, on_connect)
+        if not ok then
+            conn:close()
+            return nil, err
+        end
+        log_printf("pipe.connect(%s, %p)\n", addrspec, on_connect)
+        return conn, nil
+    end
+
+    error("addrspec must be port, host:port, or a path")
+end
+
+
+local function NewInsert(idx, text) --> table
+    return {class="i", idx=idx, text=text}
+end
+
+local function NewDelete(idx, nchars, text) --> table, text may be nil
+    return {class="d", idx=idx, nchars=nchars, text=text}
+end
+
+local function NewSubmission(seq, parent_seq, parent_id, ot) --> table
+    return {
+        class="s", seq=seq, parent_seq=parent_seq, parent_id=parent_id, ot=ot
+    }
+end
+
+local function NewExternal(seq, ot) --> table, ot is either an Insert or Delete
+    return {class="x", seq=seq, ot=ot}
+end
+
+local function NewAccept(seq) --> table
+    return {class="a", seq=seq}
+end
+
+
+function mkcb(obj, name)
+    return function(...)
+        log_printf("mkcb(%s) called!\n", name)
+        return obj[name](obj, ...)
     end
 end
 
-function Client:send_display_name()
-    local c = self
+
+local SocketTransport = {}
+SocketTransport.__index = SocketTransport
+
+-- A Transport should always keep trying to connect and communicate the
+-- messages that have been passed to it.  The Client creates one Transport
+-- object and submits each message just once, and lets the transport figure out
+-- retries.
+--
+-- The Client shouldn't be responsible for the retry logic because it may vary
+-- widely between different Transport mechanisms.
+--
+-- However, the Transport shouldn't be responsible for logging messages to file
+-- in case of process failure, because that logic should only need to be
+-- written once.
+function SocketTransport:create(
+    addrspec, connect_cb, msg_cb
+) --> SocketTransport
+    local self = {}
+    setmetatable(self, SocketTransport)
+
+    self.addrspec = addrspec
+    self.connect_cb = connect_cb
+    self.msg_cb = msg_cb
+
+    self.backoff_timer, err = uv.new_timer()
+    if not self.backoff_timer then
+        -- not recoverable
+        error(err)
+    end
+
+    self.schedule_timer, err = uv.new_timer()
+    if not self.schedule_timer then
+        -- not recoverable
+        error(err)
+    end
+
+    -- configure per-connection state
+    self:reset()
+
+    -- configure state which persists across connections
+    self.scheduled = false
+    self.write_q = {}
+
+    self:schedule()
+
+    return self
+end
+
+function SocketTransport:reset() --> nil
+    self.want_reset = false
+    self.conn = nil
+    self.connect = {
+        started = false,
+        returned = false,
+        success = false,
+        closing = false,
+        in_backoff = false,
+        backoff = 10, -- ms
+        done = false
+    }
+    self.negotiate = {sent=false, recvd=false, done=false}
+    self.leftovers = ""
+    self.nextwrite = 1
+    self.read_q = {}
+end
+
+function SocketTransport:advance_state() --> nil
+    local ok, err, done
+    log_printf("SocketTransport:advance_state\n")
+
+    -- are we resetting?
+    if self.want_reset then return end
+
+    -- do we need to connect?
+    if not self.connect.done then
+        -- are we in a backoff period?
+        if self.connect.in_backoff then return end
+        -- do we need to start a new connection?
+        if not self.connect.started then
+            self.conn, err = addrspec_connect(
+                self.addrspec, mkcb(self, "on_connect")
+            )
+            if not self.conn then
+                -- not recoverable
+                error(err)
+            end
+            self.connect.started = true
+        end
+        -- are we waiting for connect to return?
+        if not self.connect.returned then return end
+        -- did the connect complete successfully?
+        if not self.connect.success then
+            -- do we need to close the conn?
+            if self.conn then
+                if not self.connect.closing then
+                    self.connect.closing = true
+                    self.conn:close(mkcb(self, "on_connect_failed_close"))
+                end
+                return
+            end
+            -- reset some state
+            self.connect.started = false
+            self.connect.returned = false
+            -- start a new backoff timer
+            ok, err = self.backoff_timer:start(
+                --self.connect.backoff, 0, mkcb(self, "on_backoff_timer")
+                360000, 0, mkcb(self, "on_backoff_timer")
+            )
+            if not ok then
+                -- not recoverable
+                error(err)
+            end
+            self.connect.backoff = math.min(15000, self.connect.backoff * 2)
+            self.connect.in_backoff = true
+            return
+        end
+        -- connection success!
+        self.connect.backoff = 0.01
+        self.connect.done = true
+        ok, err = self.conn:read_start(mkcb(self, "on_read"))
+        if err ~= nil then
+            -- not recoverable
+            error(err)
+        end
+    end
+
+    -- complete negotiation
+    if not self.negotiate.done then
+        if not self.negotiate.sent then
+            self:send_display_name()
+            self.negotiate.sent = true
+        end
+        -- wait for data
+        if #self.read_q == 0 then return end
+        line = table.remove(self.read_q, 1)
+        err = self:read_negotiation(line)
+        if err ~= nil then
+            nvim_printf("negotiation failed: " .. err)
+            log_printf("negotiation failed: %s\n", err)
+            self:close_and_reset()
+            return
+        end
+        self.negotiate.done = true
+    end
+
+    -- send any unsent writes
+    for i = self.nextwrite, #self.write_q do
+        self:send_msg(self.write_q[i])
+    end
+    self.nextwrite = #self.write_q + 1
+
+    -- read any unread lines
+    for i = 1, #self.read_q do
+        local msg, err = self:read_msg(line)
+        -- not recoverable?
+        if err then
+            error("protocol error: " .. err)
+        end
+        self.msg_cb(msg)
+    end
+    self.read_q = {}
+end
+
+function SocketTransport:read_negotiation(line) --> err
+    -- parse the server response
+    local fields, err = split(line, ":", 3)
+    if err then return err end
+    local author_id = tonumber(fields[1])
+    self.reconnect_secret = decode(fields[2])
+    local text = decode(fields[3])
+    self.connect_cb(author_id, reconnect_secret)
+end
+
+function SocketTransport:read_msg(line) --> msg, err
+    local t, err = split(line, ":", 2)
+    if err then return nil, err end
+
+    if t[1] == "x" then
+        -- e"x"ternal edit
+        local x, err = split(t[2], ":", 4)
+        if err then return nil, err end
+        local ot
+        if x[2] == "i" then
+            ot = NewInsert(tonumber(x[3]), decode(x[4]))
+        elseif x[2] == "d" then
+            ot = NewDelete(tonumber(x[3]), tonumber(x[4]))
+        else
+            return nil, string.format("unrecognized edit type: %s", line)
+        end
+        return NewExternal(tonumber(x[1]), ot)
+    end
+
+    if t[1] == "a" then
+        -- "a"ccepted message
+        local seq = tonumber(t[2])
+        -- seq should match the seq of the first submission in our queue
+        -- XXX: where to ac"k" messages fit in this logic?
+        local first = self.write_q[1]
+        if not first then
+            return nil, string.format(
+                "got a:%d with an empty write queue", seq
+            )
+        end
+        if first.seq ~= seq then
+            return nil, string.format(
+                "expected a:%d but got a:%d", first.seq, seq
+            )
+        end
+        -- we can forget that message now
+        table.remove(self.write_q, 1)
+        self.nextwrite = self.nextwrite - 1
+        return NewAccept(seq)
+    end
+
+    return nil, string.format("unrecognized line: %s", line)
+end
+
+function SocketTransport:send_display_name()
     local user = os.getenv("USER")
-    local display = nil
+    local display
     if user ~= nil then
         display = string.format("%s on nvim", user)
     else
         display = "nvim"
     end
-    assert(c.pipe:write(string.format("new:%s\n", display), c.on_write))
+    self:send_bytes(string.format("new:%s\n", display))
 end
 
-function Client:advance_state()
-    local c = self
-
-    -- failure cleanup
-    if c.failed then
-        if c.pipe ~= nil then
-            if not c.pipe:is_closing() then
-                c.pipe:close(c.on_close)
-                return
-            end
-            return
-        end
-        -- c.pipe == nil, connection is closed
-        if not c.closed then
-            c.closed = true
-        end
-        return
-    end
-
-    -- wait for the initial connection
-    if not c.connected then
-        return
-    end
-
-    -- complete negotiation
-    if not c.negotiate.done then
-        if not c.negotiate.sent then
-            c:send_display_name()
-            c.listen_state = "negotiate"
-            c.negotiate.sent = true
-        end
-        if not c.negotiate.recvd then
-            return
-        end
-        c.listen_state = "ot"
-        c.negotiate.done = true
-        -- send any queued edits we had
-        for _, msg in ipairs(c.write_q) do
-            c:write_edit_direct(msg[1], msg[2], msg[3])
-        end
-        c.write_q = nil
-    end
-end
-
-function Client:on_connect(err)
-    local c = self
-    if err ~= nil then
-        error("connect failed: " .. err)
-    end
-    c.connected = true
-    assert(c.pipe:read_start(c.on_read))
-    c:advance_state()
-end
-
-function Client:on_close()
-    local c = self
-    c.pipe = nil
-    c:advance_state()
-end
-
-function Client:on_write(err)
-    -- TODO: on error, reconnect and renegotiate
-    -- ignore secondary write failures
-    if err ~= nil and not c.failed then
-        error("write failed: " .. err)
-    end
-end
-
-function Client:on_read(err, chunk)
-    local c = self
-    -- TODO: on error, reconnect and renegotiate
-    if err ~= nil then
-        -- ignore secondary read failures
-        if c.failed then
-            return
-        end
-        error("read failed: " .. err)
-    end
-    if chunk == nil then
-        error("EOF")
-    end
-    t = split_soft(c.leftovers .. chunk, "\n")
-    for i = 1, #t-1 do
-        c:on_line(t[i])
-    end
-    c.leftovers = t[#t]
-end
-
-function Client:on_line(line)
-    local c = self
-    if c.listen_state == "negotiate" then
-        -- parse the server response
-        local fields = split(line, ":", 3)
-        c.author_id = tonumber(fields[1])
-        c.reconnect_secret = decode(fields[2])
-        -- TODO: deal with text now that we have it
-        local text = decode(fields[3])
-        c.negotiate.recvd = true
-        c:advance_state()
-
-    elseif c.listen_state == "ot" then
-        local t = split(line, ":", 2)
-        if t[1] == "x" then
-            -- e"x"ternal edit
-            local x = split(t[2], ":", 4)
-            c.edit_seq = tonumber(x[1])
-            if x[2] == "i" then
-                c:on_external_insert(edit_seq, tonumber(x[3]), decode(x[4]))
-            elseif x[2] == "d" then
-                c:on_external_delete(edit_seq, tonumber(x[3]), tonumber(x[4]))
-            else
-                error(string.format("unrecognized edit type: %s", line))
-            end
-        elseif t[1] == "a" then
-            -- "a"ccepted message
-            edit_seq = tonumber(t[2])
-            c:on_accept(edit_seq)
-        else
-            error(string.format("unrecognized line: %s", line))
-        end
-
-    else
-        error("server sent data in invalid listen state")
-    end
-end
-
-function Client:on_external_insert(edit_seq, idx, text)
-    error("on_external_insert")
-end
-
-function Client:on_external_delete(edit_seq, idx, count)
-    error("on_external_delete")
-end
-
-function Client:on_accept(edit_seq)
-    error("on_accept")
-end
-
--- actually write to the wire
-function Client:write_edit_direct(typ, idx, arg)
-    local c = self
-    if typ == "i" then
+function SocketTransport:send_msg(msg)
+    local arg
+    assert(msg.class == "s")
+    if msg.ot.class == "i" then
         -- insertion: arg is encoded text
         arg = encode(arg)
-    elseif typ == "d" then
+    elseif msg.ot.class == "d" then
         -- deletion: arg is a deletion count
         arg = tostring(arg)
     else
-        error(string.format("unknown write_edit type: %s", typ))
+        error(string.format("unknown write_edit type: %s", msg.ot.class))
     end
-    local parent_seq = nil
-    local parent_author = nil
-    if #c.in_flight > 0 then
-        parent_seq = c.edit_seq
+    local bytes = string.format(
+        "s:%d:%d:%d:%s:%d:%s\n",
+        msg.seq, msg.parent_seq, msg.parent_id, msg.ot.class, msg.ot.idx, arg
+    )
+    self:send_bytes(bytes)
+end
+
+function SocketTransport:send_bytes(bytes) --> nil
+    log_printf("writing bytes: %s\n", bytes)
+    local ok, err = self.conn:write(bytes, mkcb(self, "on_write"))
+    if not ok then
+        -- not recoverable
+        error("write submission failed: " .. err)
+    end
+end
+
+function SocketTransport:on_write(err) --> nil
+    log_printf("SocketTransport:on_write(%s)\n", err)
+    if self.want_reset or not err then return end
+    nvim_printf("write failed, reconnecting...")
+    log_printf("write failed, reconnecting...\n")
+    self:close_and_reset()
+end
+
+function SocketTransport:on_connect(err) --> nil
+    log_printf("on_connect! err=%s\n", err)
+    self.connect.returned = true
+    self.connect.success = err == nil
+    self:advance_state()
+end
+
+function SocketTransport:on_connect_failed_close() --> nil
+    self.connect.closing = false
+    self.conn = nil
+    self:advance_state()
+end
+
+function SocketTransport:on_backoff_timer() --> nil
+    self.connect.in_backoff = false
+    self:advance_state()
+end
+
+function SocketTransport:close_and_reset() --> nil
+    log_printf("close_and_reset!\n")
+    self.want_reset = true
+    self.conn:close(mkcb(self, "on_close_for_reset"))
+end
+
+function SocketTransport:on_close_for_reset() --> nil
+    self:reset()
+    self:advance_state()
+end
+
+function SocketTransport:on_read(err, msg) --> nil
+    if self.want_reset then return end
+    if err then
+        nvim_printf("read failed (%s), reconnecting...", err)
+        log_printf("read failed (%s), reconnecting...\n", err)
+        self:close_and_reset()
+        return
+    end
+    if not chunk then
+        nvim_printf("unexpected eof, reconnecting...")
+        log_printf("unexpected eof, reconnecting...\n")
+        self:close_and_reset()
+        return
+    end
+    t = split_soft(self.leftovers .. chunk, "\n")
+    for i = 1, #t-1 do
+        table.insert(self.read_q, t[i])
+    end
+    self.leftovers = t[#t]
+    self:advance_state()
+end
+
+function SocketTransport:schedule() --> nil
+    if self.scheduled then return end
+    self.scheduled = true
+    local ok, err = self.schedule_timer:start(
+        0, 0, mkcb(self, "on_schedule_timer")
+    )
+    if not ok then
+        -- not recoverable
+        error(err)
+    end
+end
+
+function SocketTransport:on_schedule_timer() --> nil
+    self.scheduled = false
+    self:advance_state()
+end
+
+-- Client-facing API call
+function SocketTransport:write(msg) --> nil
+    table.insert(self.write_q, msg)
+    self:schedule()
+end
+
+
+local Client = {}
+Client.__index = Client
+
+function Client:create(addrspec, vim) --> Client
+    local self = {}
+    setmetatable(self, Client)
+
+    self.vim = vim
+
+    self.transport = SocketTransport:create(
+        addrspec, mkcb(self, "on_connect"), mkcb(self, "on_msg")
+    )
+
+    self.schedule_timer, err = uv.new_timer()
+    if not self.schedule_timer then
+        -- not recoverable
+        error(err)
+    end
+
+    self.scheduled = false
+    self.connected = false
+    self.author_id = nil
+    self.text = nil
+    self.first_sync = false
+
+    self.latest_server_seq = nil
+    self.seq = 0
+    self.inflight = {}
+
+    return self
+end
+
+-- luv callback
+function Client:on_connect(author_id, text) --> nil
+    if self.connected then
+        error("got a secondary on_connect call")
+    end
+    self.connected = true
+    self.author_id = author_id
+    self.text = text
+    self:schedule()
+end
+
+-- luv callback
+function Client:on_msg(msg) --> nil
+    table.insert(self.msg_q, msg)
+    self:schedule()
+end
+
+-- transition from luv context to vim context
+function Client:schedule() --> nil
+    self.vim.schedule(mkcb(self, "advance_state"))
+end
+
+-- must only execute within vim-safe callbacks
+function Client:advance_state() --> nil
+    if not self.first_sync then
+        -- XXX: overwrite the whole buffer with initial text
+        self.first_sync = true
+    end
+    -- process messages in self.msg_q
+    -- need: nvim_buf_set_text({buffer}, {start_row}, {start_col}, {end_row}, {end_col}, {replacement})
+end
+
+function Client:make_edit(ot) --> Submission
+    local parent_seq, parent_author
+    if #c.inflight > 0 then
+        parent_seq = c.seq
         parent_author = c.author_id
     else
         parent_seq = c.latest_server_seq
         parent_author = 0  -- server author id
     end
-    c.edit_seq = c.edit_seq + 1
-    local msg = string.format(
-        "s:%d:%d:%d:%s:%d:%s\n",
-        c.edit_seq, parent_seq, parent_author, typ, idx, arg
+    c.seq = c.seq + 1
+    local s = NewSubmission(c.seq, parent_seq, parent_id, ot)
+    table.insert(c.inflight, s)
+    return s
+end
+
+-- vim-safe callback
+function Client:on_insert(idx, text) --> nil
+    if not self.first_sync then return end
+    local msg = self:make_edit(NewInsert(idx, text))
+    self.transport:write(msg)
+end
+
+-- vim-safe callback
+function Client:on_delete(idx, nchars, text) --> nil
+    if not self.first_sync then return end
+    local s = self:make_edit(NewDelete(idx, nchars, text))
+    self.transport:write(msg)
+end
+
+
+if vim then
+    -- plugin execution, against the real vim
+    c = Client:create("./asdf", vim)
+
+    -- truncate log file
+    f = io.open("log", "w")
+    f:close()
+
+    local function on_bytes(
+        x, buf, tick, sr, sc, s, oer, oec, ol, ner, nec, nl
     )
-    assert(c.pipe:write(msg, c.on_write))
-    -- keep track of which edits we have in flight
-    table.insert(c.in_flight, msg)
-end
-
--- write to the wire, or save it if are disconnected
--- arg is either still-unencoded insertion text, or a deletion count
-function Client:write_edit(typ, idx, arg)
-    local c = self
-    if c.write_q == nil then
-        c:write_edit_direct(typ, idx, arg)
-    else
-        -- remember for later
-        table.insert(c.write_q, {typ, idx, arg})
-    end
-end
-
-if vim ~= nil then
-    -- plugin execution
-    c = Client:create()
-
-    function on_bytes(x, buf, tick, sr, sc, s, oer, oec, ol, ner, nec, nl)
         -- broadcast operational transforms to the server
         -- important args are s (start), ol (old len), and nl (new len)
         if ol > 0 then
-            -- emit a deletion
-            c:write_edit("d", s, ol)
+            -- XXX find deleted chars too
+            c:on_delete(s, ol, nil)
         end
         if nl > 0 then
             -- emit an insertion
@@ -430,9 +663,22 @@ if vim ~= nil then
             ner = sr + ner
             text = vim.api.nvim_buf_get_text(buf, sr, sc, ner, nec, {})
             text = table.concat(text, "\n")
-            c:write_edit("i", s, text)
+            c:on_insert(s, text)
         end
     end
 
     vim.api.nvim_buf_attach(0, false, {on_bytes=on_bytes})
+else
+    -- library execution
+    ot = {
+        encode = encode,
+        decode = decode,
+        SocketTransport = SocketTransport,
+        Client = Client,
+        NewInsert = NewInsert,
+        NewDelete = NewDelete,
+        NewSubmission = NewSubmission,
+        NewExternal = NewExternal,
+        NewAccept = NewAccept,
+    }
 end
