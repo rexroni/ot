@@ -5,6 +5,8 @@ require "table"
 require "math"
 uv = require "luv"
 
+require "split"
+
 local function nvim_printf(format, ...) --> nil
     local msg = string.format(format, ...)
     local cmd = string.format('echo "%s"', msg)
@@ -192,6 +194,141 @@ end
 
 local function NewAccept(seq) --> table
     return {class="a", seq=seq}
+end
+
+local function apply(ot, txt) --> text
+    if ot.class == "i" then
+        return table.concat(
+            {string.sub(txt, 0, ot.idx), ot.text, string.sub(txt, ot.idx+1)}
+        )
+    elseif ot.class == "d" then
+        return table.concat(
+            {string.sub(txt, 0, ot.idx), string.sub(txt, ot.idx+ot.nchars+1)}
+        )
+    else
+        error(string.format("unable to apply class = %s", ot.class))
+    end
+end
+
+local function after(a, b) --> text
+    if a.class ~= "i" and a.class ~= "d" then
+        error(string.format("unable to after(a, b) of a.class = %s", a.class))
+    end
+    if b.class ~= "i" and b.class ~= "d" then
+        error(string.format("unable to after(a, b) of b.class = %s", b.class))
+    end
+    if a.class == "i" then
+        if b.class == "i" then
+            if b.idx > a.idx then
+                -- other inserts after us
+                -- INDEPENDENT
+                return a
+            elseif b.idx == a.idx then
+                -- other inserts at the same spot
+                -- CONFLICT
+                return NewInsert(a.idx + #b.text, a.text)
+            else
+                -- other inserts before us
+                -- INDEPENDENT
+                return NewInsert(a.idx + #b.text, a.text)
+            end
+        elseif b.class == "d" then
+            if b.idx > a.idx then
+                -- delete is after us
+                -- INDEPENDENT
+                return a
+            elseif b.idx + b.nchars < a.idx then
+                -- delete is before, no overlap
+                -- INDEPENDENT
+                return NewInsert(a.idx - b.nchars, a.text)
+            else
+                -- one of:
+                -- - delete ends right where we insert; insert anyway
+                -- - delete starts right where we start; insert anyway
+                -- - delete overlaps us; insert anyway
+                -- CONFLICT
+                return NewInsert(b.idx, a.text)
+            end
+        end
+    elseif a.class == "d" then
+        if b.class == "i" then
+            if b.idx > a.idx + a.nchars then
+                -- other inserts after us, no overlap
+                -- INDEPENDENT
+                return a
+            elseif b.idx < a.idx then
+                -- other inserts before us
+                -- INDEPENDENT
+                return NewDelete(a.idx + #b.text, a.nchars, a.text)
+            elseif b.idx == a.idx then
+                -- other inserts right where we start to delete; leave it alone
+                -- CONFLICT
+                return NewDelete(a.idx + #b.text, a.nchars, a.text)
+            elseif b.idx == a.idx + a.nchars then
+                -- other inserts right where we stop deleting; leave it alone
+                -- CONFLICT
+                return a
+            else
+                -- insert into the section we hoped to delete; delete it too
+                -- CONFLICT
+                return NewDelete(a.idx, a.nchars + #b.text, None)
+            end
+        elseif b.class == "d" then
+            if b.idx >= a.idx + a.nchars then
+                -- delete is after us, no overlap
+                -- INDEPENDENT if not equal else CONFLICT
+                return a
+            elseif b.idx + b.nchars <= a.idx then
+                -- delete is before us, no overlap
+                -- INDEPENDENT if not equal else CONFLICT
+                return NewDelete(a.idx - b.nchars, a.nchars, a.text)
+            elseif b.idx <= a.idx then
+                -- other is before us (or tied) with some overlap
+                if b.idx + b.nchars >= a.idx + a.nchars then
+                    -- other deleted what we would delete already
+                    -- CONFLICT
+                    return None
+                else
+                    -- other is before and deletes part of what we would delete
+                    -- CONFLICT
+                    overlap = b.nchars - (a.idx - b.idx)
+                    return NewDelete(b.idx, a.nchars - overlap, None)
+                end
+            elseif b.idx > a.idx then
+                -- other is after us with some overlap
+                if b.idx + b.nchars > a.idx + a.nchars then
+                    -- other deletion would continue after us
+                    -- CONFLICT
+                    return NewDelete(a.idx, b.idx - a.idx, None)
+                else
+                    -- other deletion is contained within what we would delete
+                    -- CONFLICT
+                    return NewDelete(a.idx, a.nchars - b.nchars, None)
+                end
+            end
+        end
+    end
+end
+
+local function conflicts(a, b) --> bool
+    if a.class == "i" and b.class == "i" then
+        return a.idx == b.idx
+    end
+
+    if a.class == "d" and b.class == "d" then
+        if a.idx > b.idx then
+            a, b = b, a
+        end
+        return a.idx + a.nchars >= b.idx
+    end
+
+    if a.class == "i" then
+        i, d = a, b
+    else
+        i, d = b, a
+    end
+
+    return i.idx >= d.idx and i.idx <= d.idx + d.nchars
 end
 
 
@@ -680,5 +817,8 @@ else
         NewSubmission = NewSubmission,
         NewExternal = NewExternal,
         NewAccept = NewAccept,
+        apply = apply,
+        after = after,
+        conflicts = conflicts,
     }
 end

@@ -833,7 +833,7 @@ def decode_ot(typ_text, idx_text, arg_text):
     if typ_text == b"i":
         return Insert(int(idx_text), decode_text(arg_text))
     elif typ_text == b"d":
-        return Delete(int(idx_text), int(arg_text))
+        return Delete(int(idx_text), int(arg_text), None)
 
 
 def encode_ot(ot):

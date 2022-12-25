@@ -1,6 +1,8 @@
+require "io"
 require "table"
 require "string"
 
+require "split"
 require "ot"
 
 local function test_encode_decode()
@@ -38,5 +40,84 @@ local function test_encode_decode()
     end
 end
 
+local function test_suite()
+
+    local function read_obj(blob)
+        local x = split_soft(blob, ":", 3)
+        if x[1] == "i" then
+            return ot.NewInsert(tonumber(x[2]), ot.decode(x[3]))
+        elseif x[1] == "d" then
+            return ot.NewDelete(tonumber(x[2]), tonumber(x[3]))
+        elseif x[1] == "x" then
+            return nil
+        else
+            error(string.format("unrecognized object: %s", blob))
+        end
+    end
+
+    local function show_obj(obj)
+        if obj == nil then
+            return "\"x\""
+        end
+        local arg
+        if obj.class == "i" then
+            arg = obj.text
+        else
+            arg = tostring(obj.nchars)
+        end
+        return string.format("\"%s:%d:%s\"", obj.class, obj.idx, arg)
+    end
+
+    for line in io.lines("test_suite") do
+        -- skip empty lines and comments
+        if line == "" or string.sub(line, 1, 1) == "#" then goto nextline end
+        local x = split_soft(line, "|")
+        if x[1] == "apply" then
+            local obj = read_obj(x[2])
+            local text = x[3]
+            local exp = x[4]
+            local got = ot.apply(obj, text)
+            if got ~= exp then
+                error(
+                    string.format(
+                        "apply(%s, \"%s\") returns \"%s\" but expected \"%s\"",
+                        show_obj(obj), text, got, exp
+                    )
+                )
+            end
+        elseif x[1] == "after" then
+            local a = read_obj(x[2])
+            local b = read_obj(x[3])
+            local exp = read_obj(x[4])
+            local got = ot.after(a, b)
+            if show_obj(got) ~= show_obj(exp) then
+                error(
+                    string.format(
+                        "after(%s, %s) returns %s but expected %s",
+                        show_obj(a), show_obj(b), show_obj(got), show_obj(exp)
+                    )
+                )
+            end
+        elseif x[1] == "conflicts" then
+            local a = read_obj(x[2])
+            local b = read_obj(x[3])
+            local exp = (x[4] == "true")
+            local got = ot.conflicts(a, b)
+            if got ~= exp then
+                error(
+                    string.format(
+                        "conflicts(%s, %s) returns %s but expected %s",
+                        show_obj(a), show_obj(b), tostring(got), tostring(exp)
+                    )
+                )
+            end
+        else
+            error(string.format("unparsed line of test_suite: %s", line))
+        end
+        ::nextline::
+    end
+end
+
 test_encode_decode()
+test_suite()
 print("PASS!")
