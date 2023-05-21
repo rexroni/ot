@@ -1,9 +1,13 @@
+require "string"
+
 require "split"
 
 -- breaktree: a data structure to convert rapidly between line/column and index
 -- - implements an Andersson tree for balancing
 -- - nodes track cumulative line and character counts for O(log(n)) lookups
 --   from index to line/column and back
+-- - nodes track text content to be able to look up deleted text after a
+--   deletion occurs
 
 local function print_tree(node, indent) --> nil
     if not node then return end
@@ -20,7 +24,7 @@ end
 local Line = {}
 Line.__index = Line
 
-function Line:create(len) --> Line
+function Line:create(text) --> Line
     local self = {}
     setmetatable(self, Line)
 
@@ -37,8 +41,8 @@ function Line:create(len) --> Line
     -- prev node
     self.p = nil
 
-    -- the length of this line
-    self.len = len
+    -- the text of this line
+    self.text = text
     -- the sum of lengths to the left of this node
     self.lsum = 0
     -- the count of lines to the left of this node
@@ -50,7 +54,7 @@ end
 function Line:repr() --> string
     return string.format(
         "[level=%d, len=%d lcount=%d, lsum=%d]",
-        self.level, self.len, self.lcount, self.lsum
+        self.level, #self.text, self.lcount, self.lsum
     )
 end
 
@@ -72,7 +76,7 @@ function Line:skew() --> Line (the new root)
     if child then child.parent = self end
     self.parent = out
     out.parent = parent
-    self.lsum = self.lsum - out.lsum - out.len
+    self.lsum = self.lsum - out.lsum - #out.text
     self.lcount = self.lcount - out.lcount - 1
     if parent.r == self then
         parent.r = out
@@ -102,7 +106,7 @@ function Line:split() --> Line (the new root)
     if child then child.parent = self end
     self.parent = out
     out.parent = parent
-    out.lsum = out.lsum + self.lsum + self.len
+    out.lsum = out.lsum + self.lsum + #self.text
     out.lcount = out.lcount + self.lcount + 1
     if parent.r == self then
         parent.r = out
@@ -136,7 +140,7 @@ function BreakTree:create() --> BreakTree
     -- we start with a "ghost" character at the end of the document
     -- if we imagine it is a newline, we can assume all lines end in newlines
     -- also this allows Insert(0, "text") to work normally on an empty document
-    local ghost = Line:create(1)
+    local ghost = Line:create("\n")
     -- configure our linked list
     self.n = ghost
     self.p = ghost
@@ -157,31 +161,22 @@ function BreakTree:find(char_idx) --> Line, line_idx, row_idx
         if node.lsum > char_idx then
             -- descend leftwards
             node = node.l
-        elseif node.lsum + node.len > char_idx then
+        elseif node.lsum + #node.text > char_idx then
             -- this is the node!
             return node, line_idx + node.lcount, char_idx - node.lsum
         else
             -- descend rightwards
             line_idx = line_idx + node.lcount + 1
-            lsum = lsum + node.lsum + node.len
-            char_idx = char_idx - node.lsum - node.len
+            lsum = lsum + node.lsum + #node.text
+            char_idx = char_idx - node.lsum - #node.text
             node = node.r
         end
     end
     error("node not found!")
 end
 
-function BreakTree:modlen(node, diff) --> nil
-    if diff == 0 then return end
-    node.len = node.len + diff
-    if node.len < 1 then
-        error(
-            string.format(
-                "modlen(%s, %d) results in invalid length", node:repr(), diff
-            )
-        )
-    end
-    -- walk up the tree, correcting .lsum on every node
+-- walk up the tree correcting .lsum on every node after a change to this node
+function BreakTree:fix_lsums(node, diff) --> nil
     local parent = node.parent
     while parent ~= self do
         if parent.l == node then
@@ -192,8 +187,8 @@ function BreakTree:modlen(node, diff) --> nil
     end
 end
 
-function BreakTree:insert_line(node, len) --> nil
-    local new = Line:create(len)
+function BreakTree:insert_line(node, text) --> nil
+    local new = Line:create(text)
     -- insert into linked list
     new:link_before(node)
 
@@ -216,7 +211,7 @@ function BreakTree:insert_line(node, len) --> nil
     local temp = new.parent
     while temp ~= self do
         if temp.l == child then
-            temp.lsum = temp.lsum + len
+            temp.lsum = temp.lsum + #text
             temp.lcount = temp.lcount + 1
         end
         temp = temp:skew()
@@ -229,18 +224,22 @@ end
 function BreakTree:insert_text(idx, text) --> line_idx, row_idx
     local node, line_idx, row_idx = self:find(idx)
     local tlines = split_soft(text, '\n')
+    local before = string.sub(node.text, 1, row_idx)
+    local after = string.sub(node.text, row_idx + 1, -1)
     if #tlines == 1 then
         -- only one line, just grow this line
-        self:modlen(node, #text)
+        node.text = before .. text .. after
+        self:fix_lsums(node, #text)
     else
         -- multiple lines:
-        -- first added line is added to start of this line
-        self:insert_line(node, row_idx + #tlines[1] + 1)
-        -- last unfinished line is added to end of this line
-        self:modlen(node, #tlines[#tlines] - row_idx)
+        -- first added line is appended to start of this line
+        self:insert_line(node, before .. tlines[1] .. "\n")
+        -- last unfinished line is prepended to end of this line
+        node.text = tlines[#tlines] .. after
+        self:fix_lsums(node, #tlines[#tlines] - row_idx)
         -- complete lines in between are added as brand new lines
         for i = 2, #tlines - 1 do
-            self:insert_line(node, #tlines[i] + 1)
+            self:insert_line(node, tlines[i] .. "\n")
         end
     end
     return line_idx, row_idx
@@ -278,7 +277,7 @@ function BreakTree:delete_line(node) --> nil
     local parent = node.parent
     while parent ~= self do
         if parent.l == temp then
-            parent.lsum = parent.lsum - node.len
+            parent.lsum = parent.lsum - #node.text
             parent.lcount = parent.lcount - 1
         end
         temp = parent
@@ -288,7 +287,6 @@ function BreakTree:delete_line(node) --> nil
     parent = node.parent
     local rebalance_from = nil
     local max_level = nil
-    local len = node.len
     if not node.l then
         -- first case; remove node and promote node.r
         node:unlink()
@@ -314,7 +312,7 @@ function BreakTree:delete_line(node) --> nil
     else
         -- second case; replace node with node.p
         local prev = node.p
-        node.len = prev.len
+        node.text = prev.text
         prev:unlink()
         if prev.l or prev.r then
             error("deletion case two trivial removal assertion failed")
@@ -331,7 +329,7 @@ function BreakTree:delete_line(node) --> nil
         rebalance_from = prev.parent
         max_level = 0
         -- adjust node's lsum and lcount for the removed left-child
-        node.lsum = node.lsum - prev.len
+        node.lsum = node.lsum - #prev.text
         node.lcount = node.lcount - 1
     end
 
@@ -358,7 +356,7 @@ function BreakTree:delete_line(node) --> nil
     end
 end
 
-function BreakTree:delete_text(idx, nchars) --> sl, sr, el, er
+function BreakTree:delete_text(idx, nchars) --> string, sl, sr, el, er
     -- the math here assumes that nchars is always at least 1
     assert(nchars >= 1)
 
@@ -370,33 +368,45 @@ function BreakTree:delete_text(idx, nchars) --> sl, sr, el, er
     local el_out, er_out = el, er
     if er == 0 then
         el_out = el_out - 1
-        er_out = node.p.len
+        er_out = #node.p.text
     end
 
     if nchars <= er then
         -- deletion is entirely within this line
-        self:modlen(node, -nchars)
+        local before = string.sub(node.text, 1, sr)
+        local target = string.sub(node.text, sr + 1, er)
+        local after = string.sub(node.text, er + 1, #node.text)
+        node.text = before .. after
+        self:fix_lsums(node, -nchars)
         -- no lines to delete
-        return sl, sr, el_out, er_out
+        return target, sl, sr, el_out, er_out
     end
 
     -- delete before er in this line
-    self:modlen(node, -er)
+    local target = string.sub(node.text, 1, er)
+    local after = string.sub(node.text, er + 1, #node.text)
+    node.text = after
+    self:fix_lsums(node, -er)
     nchars = nchars - er
 
     -- delete entire lines
-    while nchars > 0 and nchars >= node.p.len do
-        nchars = nchars - node.p.len
+    while nchars > 0 and nchars >= #node.p.text do
+        nchars = nchars - #node.p.text
+        target = node.p.text .. target
         self:delete_line(node.p)
     end
 
     -- merge the last line into this line
     if nchars > 0 then
-        self:modlen(node, node.p.len - nchars)
+        local before = string.sub(node.p.text, 1, #node.p.text - nchars)
+        local deleted = string.sub(node.p.text, #node.p.text - nchars + 1, -1)
+        target = deleted .. target
+        node.text = before .. node.text
+        self:fix_lsums(node, #before)
         self:delete_line(node.p)
     end
 
-    return sl, sr, el_out, er_out
+    return target, sl, sr, el_out, er_out
 end
 
 function BreakTree:print() --> nil

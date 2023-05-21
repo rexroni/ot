@@ -36,7 +36,7 @@ local function check_tree(parent, node) --> node count, len sum
         assert(node.level ~= node.r.r.level)
     end
 
-    return lcount + 1 + rcount, lsum + node.len + rsum
+    return lcount + 1 + rcount, lsum + #node.text + rsum
 end
 
 local function build_test_tree() --> BreakTree
@@ -50,9 +50,9 @@ local function build_test_tree() --> BreakTree
     --                     k0  m0      q0    t0
     --                                   r0    u0
 
-    local function mknode(len, level, prev, parent, child) --> Line
+    local function mknode(text, level, prev, parent, child) --> Line
         assert(level)
-        local node = breaktree.Line:create(len)
+        local node = breaktree.Line:create(text)
         node.level = level
         if prev then
             node.p = prev
@@ -71,27 +71,27 @@ local function build_test_tree() --> BreakTree
         return node
     end
 
-    local a = mknode(1,  0, nil, nil, nil)
-    local b = mknode(2,  1, a, nil, a)
-    local c = mknode(3,  0, b, b, nil)
-    local d = mknode(4,  2, c, nil, b)
-    local e = mknode(5,  0, d, nil, nil)
-    local f = mknode(6,  1, e, d, e)
-    local g = mknode(7,  0, f, f, nil)
-    local h = mknode(8,  3, g, nil, d)
-    local i = mknode(9,  0, h, nil, nil)
-    local j = mknode(10, 1, i, nil, i)
-    local k = mknode(11, 0, j, nil, nil)
-    local l = mknode(12, 1, k, j, k)
-    local m = mknode(13, 0, l, l, nil)
-    local n = mknode(14, 2, m, h, j)
-    local o = mknode(15, 0, n, nil, nil)
-    local p = mknode(16, 1, o, n, o)
-    local q = mknode(17, 0, p, nil, nil)
-    local r = mknode(18, 0, q, q, nil)
-    local s = mknode(19, 1, r, p, q)
-    local t = mknode(20, 0, s, s, nil)
-    local u = mknode(21, 0, t, t, nil)
+    local a = mknode("a",                     0, nil, nil, nil)
+    local b = mknode("ab",                    1, a, nil, a)
+    local c = mknode("abc",                   0, b, b, nil)
+    local d = mknode("abcd",                  2, c, nil, b)
+    local e = mknode("abcde",                 0, d, nil, nil)
+    local f = mknode("abcdef",                1, e, d, e)
+    local g = mknode("abcdefg",               0, f, f, nil)
+    local h = mknode("abcdefgh",              3, g, nil, d)
+    local i = mknode("abcdefghi",             0, h, nil, nil)
+    local j = mknode("abcdefghij",            1, i, nil, i)
+    local k = mknode("abcdefghijk",           0, j, nil, nil)
+    local l = mknode("abcdefghijkl",          1, k, j, k)
+    local m = mknode("abcdefghijklm",         0, l, l, nil)
+    local n = mknode("abcdefghijklmn",        2, m, h, j)
+    local o = mknode("abcdefghijklmno",       0, n, nil, nil)
+    local p = mknode("abcdefghijklmnop",      1, o, n, o)
+    local q = mknode("abcdefghijklmnopq",     0, p, nil, nil)
+    local r = mknode("abcdefghijklmnopqr",    0, q, q, nil)
+    local s = mknode("abcdefghijklmnopqrs",   1, r, p, q)
+    local t = mknode("abcdefghijklmnopqrst",  0, s, s, nil)
+    local u = mknode("abcdefghijklmnopqrstu", 0, t, t, nil)
 
     local bt = breaktree.BreakTree:create()
     a.p = bt
@@ -105,7 +105,7 @@ local function build_test_tree() --> BreakTree
         if not node then return 0, 0 end
         node.lcount, node.lsum = counts(node.l)
         local rcount, rsum = counts(node.r)
-        return node.lcount + 1 + rcount, node.lsum + node.len + rsum
+        return node.lcount + 1 + rcount, node.lsum + #node.text + rsum
     end
 
     local count, sum = counts(h)
@@ -129,8 +129,8 @@ local function test_insert_delete_nodes()
         for j = 1, i do
             node = node.n
         end
-        assert(node.len == i)
-        bt:insert_line(node, 1)
+        assert(#node.text == i)
+        bt:insert_line(node, "z")
         check_tree(bt, bt.r)
     end
 
@@ -141,7 +141,7 @@ local function test_insert_delete_nodes()
         for j = 1, i do
             node = node.n
         end
-        assert(node.len == i)
+        assert(#node.text == i)
         bt:delete_line(node)
         check_tree(bt, bt.r)
     end
@@ -149,7 +149,7 @@ end
 
 local function test_insert_delete_text()
     local bt = breaktree.BreakTree:create()
-    local i, l, r, count, sum, sl, sr, el, er
+    local i, l, r, count, sum, d, sl, sr, el, er
 
     local verbose = false
 
@@ -195,51 +195,51 @@ local function test_insert_delete_text()
     assert(count == 8 and sum == 21)
 
     -- delete text from a single line
-    sl, sr, el, er = bt:delete_text(7, 1)
+    d, sl, sr, el, er = bt:delete_text(7, 1)
     show("ab|bc|cc|ddd||ccb|||")
-    assert(sl == 2 and sr == 1 and el == 2 and er == 2)
+    assert(d == "c" and sl == 2 and sr == 1 and el == 2 and er == 2)
     count, sum = check_tree(bt, bt.r)
     assert(count == 8 and sum == 20)
 
     -- delete just a line break
-    sl, sr, el, er = bt:delete_text(8, 1)
+    d, sl, sr, el, er = bt:delete_text(8, 1)
     show("ab|bc|ccddd||ccb|||")
-    assert(sl == 2 and sr == 2 and el == 2 and er == 3)
+    assert(d == "\n" and sl == 2 and sr == 2 and el == 2 and er == 3)
     count, sum = check_tree(bt, bt.r)
     assert(count == 7 and sum == 19)
 
     -- delete in the middle of a line
-    sl, sr, el, er = bt:delete_text(8, 1)
+    d, sl, sr, el, er = bt:delete_text(8, 1)
     show("ab|bc|ccdd||ccb|||")
-    assert(sl == 2 and sr == 2 and el == 2 and er == 3)
+    assert(d == "d" and sl == 2 and sr == 2 and el == 2 and er == 3)
     count, sum = check_tree(bt, bt.r)
     assert(count == 7 and sum == 18)
 
     -- delete the end of a line
-    sl, sr, el, er = bt:delete_text(14, 1)
+    d, sl, sr, el, er = bt:delete_text(14, 1)
     show("ab|bc|ccdd||cc|||")
-    assert(sl == 4 and sr == 2 and el == 4 and er == 3)
+    assert(d == "b" and sl == 4 and sr == 2 and el == 4 and er == 3)
     count, sum = check_tree(bt, bt.r)
     assert(count == 7 and sum == 17)
 
     -- delete exactly one line
-    sl, sr, el, er = bt:delete_text(12, 3)
+    d, sl, sr, el, er = bt:delete_text(12, 3)
     show("ab|bc|ccdd||||")
-    assert(sl == 4 and sr == 0 and el == 4 and er == 3)
+    assert(d == "cc\n" and sl == 4 and sr == 0 and el == 4 and er == 3)
     count, sum = check_tree(bt, bt.r)
     assert(count == 6 and sum == 14)
 
     -- delete from the middle of a one line to middle of another
-    sl, sr, el, er = bt:delete_text(4, 4)
+    d, sl, sr, el, er = bt:delete_text(4, 5)
     show("ab|bdd||||")
-    assert(sl == 1 and sr == 1 and el == 2 and er == 2)
+    assert(d == "c\nccd" and sl == 1 and sr == 1 and el == 2 and er == 3)
     count, sum = check_tree(bt, bt.r)
-    assert(count == 5 and sum == 10)
+    assert(count == 5 and sum == 9)
 
     -- delete the rest
-    sl, sr, el, er = bt:delete_text(0, 9)
+    d, sl, sr, el, er = bt:delete_text(0, 8)
     show("|")
-    assert(sl == 0 and sr == 0 and el == 3 and er == 1)
+    assert(d == "ab\nbd\n\n\n" and sl == 0 and sr == 0 and el == 3 and er == 1)
     count, sum = check_tree(bt, bt.r)
     assert(count == 1 and sum == 1)
 end
