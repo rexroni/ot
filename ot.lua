@@ -6,6 +6,7 @@ require "math"
 uv = require "luv"
 
 require "split"
+require "breaktree"
 
 local function nvim_printf(format, ...) --> nil
     local msg = string.format(format, ...)
@@ -26,6 +27,7 @@ end
 local function log_printf(format, ...) --> nil
     local msg = string.format(format, ...)
     local f = io.open("log", "a")
+    f:write("lua| ")
     f:write(msg)
     f:close()
 end
@@ -482,11 +484,13 @@ function SocketTransport:advance_state() --> nil
             self:close_and_reset()
             return
         end
+        log_printf("negotiation read: %s\n", line)
         self.negotiate.done = true
     end
 
     -- send any unsent writes
     for i = self.nextwrite, #self.write_q do
+        log_printf("sening unset write[%d]: %s\n", i, tostring(self.write_q[i]))
         self:send_msg(self.write_q[i])
     end
     self.nextwrite = #self.write_q + 1
@@ -505,12 +509,13 @@ end
 
 function SocketTransport:read_negotiation(line) --> err
     -- parse the server response
-    local fields, err = split(line, ":", 3)
+    local fields, err = split(line, ":", 4)
     if err then return err end
     local author_id = tonumber(fields[1])
-    self.reconnect_secret = decode(fields[2])
-    local text = decode(fields[3])
-    self.connect_cb(author_id, reconnect_secret)
+    self.reconnect_secret = fields[2]
+    local seqno = tonumber(fields[3])
+    local text = decode(fields[4])
+    self.connect_cb(author_id, seqno, text)
 end
 
 function SocketTransport:read_msg(line) --> msg, err
@@ -536,7 +541,7 @@ function SocketTransport:read_msg(line) --> msg, err
         -- "a"ccepted message
         local seq = tonumber(t[2])
         -- seq should match the seq of the first submission in our queue
-        -- XXX: where to ac"k" messages fit in this logic?
+        -- XXX: where do ac"k" messages fit in this logic?
         local first = self.write_q[1]
         if not first then
             return nil, string.format(
@@ -633,7 +638,7 @@ function SocketTransport:on_close_for_reset() --> nil
     self:advance_state()
 end
 
-function SocketTransport:on_read(err, msg) --> nil
+function SocketTransport:on_read(err, chunk) --> nil
     if self.want_reset then return end
     if err then
         nvim_printf("read failed (%s), reconnecting...", err)
@@ -647,6 +652,7 @@ function SocketTransport:on_read(err, msg) --> nil
         self:close_and_reset()
         return
     end
+    log_printf("SocketTransport read: %s\n", encode(chunk))
     t = split_soft(self.leftovers .. chunk, "\n")
     for i = 1, #t-1 do
         table.insert(self.read_q, t[i])
@@ -712,12 +718,13 @@ function Client:create(addrspec, vim) --> Client
 end
 
 -- luv callback
-function Client:on_connect(author_id, text) --> nil
+function Client:on_connect(author_id, seqno, text) --> nil
     if self.connected then
         error("got a secondary on_connect call")
     end
     self.connected = true
     self.author_id = author_id
+    log_printf("Client:on_connect(author_id=%d, seqno=%d text=%s)\n", author_id, seqno, encode(text))
     self.text = text
     self:schedule()
 end
@@ -736,11 +743,16 @@ end
 -- must only execute within vim-safe callbacks
 function Client:advance_state() --> nil
     if not self.first_sync then
-        -- XXX: overwrite the whole buffer with initial text
+        vim.api.nvim_buf_set_lines(
+            0,    -- current buffer
+            0,    -- first line
+            -1,   -- to last line
+            true, -- strict indexing
+            split_soft(self.text, "\n")
+        )
         self.first_sync = true
     end
-    -- process messages in self.msg_q
-    -- need: nvim_buf_set_text({buffer}, {start_row}, {start_col}, {end_row}, {end_col}, {replacement})
+    -- XXX: process messages in self.msg_q
 end
 
 function Client:make_edit(ot) --> Submission
@@ -776,6 +788,7 @@ end
 if vim then
     -- plugin execution, against the real vim
     c = Client:create("./asdf", vim)
+    bt = breaktree.BreakTree.create()
 
     -- truncate log file
     f = io.open("log", "w")
