@@ -933,65 +933,6 @@ class SocketTransport:
         assert self.edit_server is None, "edit_server is already set!"
         self.edit_server = edit_server
 
-    async def acceptor(self, sock):
-        while True:
-            conn, _ = await sock.accept()
-            self.nursery.start_soon(self.negotiator, conn)
-
-    async def negotiator(self, conn):
-        # initial client negotiation
-        buf = b""
-        while b"\n" not in buf:
-            byts = await conn.recv(4096)
-            if not byts:
-                print("connection broke before negotiation finished")
-                return
-            assert byts
-            buf += byts
-        line, buf = buf.split(b"\n", maxsplit=1)
-        cmd, rest = line.split(b":", maxsplit=1)
-        if cmd == b"new":
-            name = rest
-            print(f"new connection from {name}")
-            text = encode_text(self.edit_server.text)
-            # XXX: real author id
-            # XXX: real reconnection secret
-            latest_seq = self.edit_server.edits[-1].id.seq
-            await conn.send(b"%d:%s:%d:%s\n"%(1, b"secret", latest_seq, text))
-        else:
-            raise ValueError(f"non-new negotiation detected: {line}")
-
-        # start full-duplex OT streaming
-        await self.edit_server.on_connect(conn)
-
-        w, r = trio.open_memory_channel(10)
-        self.chans[conn] = w
-        self.nursery.start_soon(self.writer, conn, r)
-        if buf:
-            # feed leftover bytes before reading anything else
-            await self.edit_server.on_read(conn, buf)
-        self.nursery.start_soon(self.reader, conn)
-        # TODO: detect disconnects somehow
-
-    async def writer(self, conn, chan):
-        while True:
-            msg = await chan.receive()
-            while msg:
-                n = await conn.send(msg)
-                msg = msg[n:]
-
-    async def write(self, conn, msg):
-        await self.chans[conn].send(msg)
-
-    async def reader(self, conn):
-        while True:
-            byts = await conn.recv(4096)
-            # TODO: error handling, maybe like proxy.py::handle_conn()
-            with open("log", "a") as f:
-                f.write(f"ot.py read bytes: {byts}\n")
-            assert byts, byts
-            await self.edit_server.on_read(conn, byts)
-
     async def run(self):
         assert self.edit_server is not None, "edit server is not set"
         with socket.socket(self.family) as sock:
@@ -1000,6 +941,96 @@ class SocketTransport:
             with trio.CancelScope() as self.cancel_scope:
                 async with trio.open_nursery() as self.nursery:
                     self.nursery.start_soon(self.acceptor, sock)
+
+    async def acceptor(self, sock):
+        while True:
+            conn, _ = await sock.accept()
+            with open("log", "a") as f:
+                f.write(f"py | accepted connection\n")
+            self.nursery.start_soon(self.run_connection, conn)
+
+    async def run_connection(self, conn):
+        try:
+            # initial client negotiation
+            buf = b""
+            while b"\n" not in buf:
+                byts = await conn.recv(4096)
+                with open("log", "a") as f:
+                    f.write(f"py | negotiator read: {byts}\n")
+                if not byts:
+                    print("connection broke before negotiation finished")
+                    return
+                assert byts
+                buf += byts
+            line, buf = buf.split(b"\n", maxsplit=1)
+            cmd, rest = line.split(b":", maxsplit=1)
+            if cmd == b"new":
+                name = rest
+                print(f"new connection from {name}")
+                text = encode_text(self.edit_server.text)
+                # XXX: real author id
+                # XXX: real reconnection secret
+                latest_seq = self.edit_server.edits[-1].id.seq
+                msg = b"%d:%s:%d:%s\n"%(1, b"secret", latest_seq, text)
+                with open("log", "a") as f:
+                    f.write(f"py | negotiator writing: {msg}\n")
+                await conn.send(msg)
+            else:
+                raise ValueError(f"non-new negotiation detected: {line}")
+
+            # start full-duplex OT streaming
+            w, r = trio.open_memory_channel(10)
+            self.chans[conn] = w
+            await self.edit_server.on_connect(conn)
+            try:
+                with trio.CancelScope() as cancel_conn:
+                    cancel = cancel_conn.cancel
+                    async with trio.open_nursery() as nursery:
+                        self.nursery.start_soon(self.writer, conn, r, cancel)
+                        if buf:
+                            # feed leftover bytes before reading anything else
+                            await self.edit_server.on_read(conn, buf)
+                        self.nursery.start_soon(self.reader, conn, cancel)
+            finally:
+                # tell the edit server we're closing
+                await self.edit_server.on_disconnect(conn)
+                # drain write queue
+                while await r.receive():
+                    pass
+                # server is guaranteed to be done with this chan
+                del self.chans[conn]
+        except Exception as e:
+            with open("log", "a") as f:
+                f.write(f"py | connection failed: {e}\n")
+        finally:
+            conn.close()
+
+    async def writer(self, conn, chan, cancel_fn):
+        try:
+            while True:
+                msg = await chan.receive()
+                while msg:
+                    with open("log", "a") as f:
+                        f.write(f"py | writing: {byts}\n")
+                    n = await conn.send(msg)
+                    msg = msg[n:]
+        except:
+            cancel_fn()
+
+    async def write(self, conn, msg):
+        await self.chans[conn].send(msg)
+
+    async def reader(self, conn, cancel_fn):
+        try:
+            while True:
+                byts = await conn.recv(4096)
+                # TODO: error handling, maybe like proxy.py::handle_conn()
+                with open("log", "a") as f:
+                    f.write(f"py | read bytes: {byts}\n")
+                assert byts, byts
+                await self.edit_server.on_read(conn, byts)
+        except:
+            cancel_fn()
 
 
 class ID:
@@ -1186,6 +1217,8 @@ class EditServer:
         self.shadows[conn] = Shadow(self.edits[-1].id)
 
     async def on_disconnect(self, conn):
+        # sync our disconnection with the queue
+        await self.transport.write(conn, None)
         self.conns.remove(conn)
         del self.defraggers[conn]
         del self.shadows[conn]
