@@ -2,6 +2,7 @@ import abc
 import contextlib
 import collections
 import os
+import traceback
 
 import trio
 from trio import socket
@@ -551,6 +552,11 @@ Server messages:
 
 """
 
+def log(*arg, **kwarg):
+    with open("log", "a") as f:
+        kwarg["file"] = f
+        print("py |", *arg, **kwarg)
+
 class OT(metaclass=abc.ABCMeta):
     """
     Operational Transform object.
@@ -986,11 +992,11 @@ class SocketTransport:
                 with trio.CancelScope() as cancel_conn:
                     cancel = cancel_conn.cancel
                     async with trio.open_nursery() as nursery:
-                        self.nursery.start_soon(self.writer, conn, r, cancel)
+                        nursery.start_soon(self.writer, conn, r, cancel)
                         if buf:
                             # feed leftover bytes before reading anything else
                             await self.edit_server.on_read(conn, buf)
-                        self.nursery.start_soon(self.reader, conn, cancel)
+                        nursery.start_soon(self.reader, conn, cancel)
             finally:
                 # tell the edit server we're closing
                 await self.edit_server.on_disconnect(conn)
@@ -1002,6 +1008,8 @@ class SocketTransport:
         except Exception as e:
             with open("log", "a") as f:
                 f.write(f"py | connection failed: {e}\n")
+            traceback.format_exc()
+            raise
         finally:
             conn.close()
 
@@ -1009,12 +1017,13 @@ class SocketTransport:
         try:
             while True:
                 msg = await chan.receive()
+                if msg is None:
+                    return
+                log(f"writing: {msg}")
                 while msg:
-                    with open("log", "a") as f:
-                        f.write(f"py | writing: {byts}\n")
                     n = await conn.send(msg)
                     msg = msg[n:]
-        except:
+        finally:
             cancel_fn()
 
     async def write(self, conn, msg):
@@ -1029,7 +1038,7 @@ class SocketTransport:
                     f.write(f"py | read bytes: {byts}\n")
                 assert byts, byts
                 await self.edit_server.on_read(conn, byts)
-        except:
+        finally:
             cancel_fn()
 
 

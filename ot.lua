@@ -497,7 +497,7 @@ function SocketTransport:advance_state() --> nil
 
     -- read any unread lines
     for i = 1, #self.read_q do
-        local msg, err = self:read_msg(line)
+        local msg, err = self:read_msg(self.read_q[i])
         -- not recoverable?
         if err then
             error("protocol error: " .. err)
@@ -578,10 +578,10 @@ function SocketTransport:send_msg(msg)
     assert(msg.class == "s")
     if msg.ot.class == "i" then
         -- insertion: arg is encoded text
-        arg = encode(arg)
+        arg = encode(msg.ot.text)
     elseif msg.ot.class == "d" then
         -- deletion: arg is a deletion count
-        arg = tostring(arg)
+        arg = tostring(msg.ot.nchars)
     else
         error(string.format("unknown write_edit type: %s", msg.ot.class))
     end
@@ -593,7 +593,7 @@ function SocketTransport:send_msg(msg)
 end
 
 function SocketTransport:send_bytes(bytes) --> nil
-    log_printf("writing bytes: %s\n", bytes)
+    log_printf("writing bytes: %s\n", encode(bytes))
     local ok, err = self.conn:write(bytes, mkcb(self, "on_write"))
     if not ok then
         -- not recoverable
@@ -713,6 +713,7 @@ function Client:create(addrspec, vim) --> Client
     self.latest_server_seq = nil
     self.seq = 0
     self.inflight = {}
+    self.msg_q = {}
 
     return self
 end
@@ -726,6 +727,7 @@ function Client:on_connect(author_id, seqno, text) --> nil
     self.author_id = author_id
     log_printf("Client:on_connect(author_id=%d, seqno=%d text=%s)\n", author_id, seqno, encode(text))
     self.text = text
+    self.latest_server_seq = seqno
     self:schedule()
 end
 
@@ -765,7 +767,7 @@ function Client:make_edit(ot) --> Submission
         parent_author = 0  -- server author id
     end
     c.seq = c.seq + 1
-    local s = NewSubmission(c.seq, parent_seq, parent_id, ot)
+    local s = NewSubmission(c.seq, parent_seq, parent_author, ot)
     table.insert(c.inflight, s)
     return s
 end
