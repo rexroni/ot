@@ -168,7 +168,7 @@ local function addrspec_connect(addrspec, on_connect) --> (conn|nil, err)
             conn:close()
             return nil, err
         end
-        log_printf("pipe.connect(%s, %p)\n", addrspec, on_connect)
+        -- log_printf("pipe.connect(%s, %p)\n", addrspec, on_connect)
         return conn, nil
     end
 
@@ -359,7 +359,7 @@ end
 
 function mkcb(obj, name)
     return function(...)
-        log_printf("mkcb(%s) called!\n", name)
+        -- log_printf("mkcb(%s) called!\n", name)
         return obj[name](obj, ...)
     end
 end
@@ -503,17 +503,17 @@ function SocketTransport:advance_state() --> nil
         err = self:read_negotiation(line)
         if err ~= nil then
             nvim_printf("negotiation failed: " .. err)
-            log_printf("negotiation failed: %s\n", err)
+            -- log_printf("negotiation failed: %s\n", err)
             self:close_and_reset()
             return
         end
-        log_printf("negotiation read: %s\n", line)
+        -- log_printf("negotiation read: %s\n", line)
         self.negotiate.done = true
     end
 
     -- send any unsent writes
     for i = self.nextwrite, #self.write_q do
-        log_printf("sening unset write[%d]: %s\n", i, tostring(self.write_q[i]))
+        log_printf("writing message\n")
         self:send_msg(self.write_q[i])
     end
     self.nextwrite = #self.write_q + 1
@@ -564,7 +564,6 @@ function SocketTransport:read_msg(line) --> msg, err
         -- "a"ccepted message
         local seq = tonumber(t[2])
         -- seq should match the seq of the first submission in our queue
-        -- XXX: where do ac"k" messages fit in this logic?
         local first = self.write_q[1]
         if not first then
             return nil, string.format(
@@ -616,7 +615,7 @@ function SocketTransport:send_msg(msg)
 end
 
 function SocketTransport:send_bytes(bytes) --> nil
-    log_printf("writing bytes: %s\n", encode(bytes))
+    -- log_printf("writing bytes: %s\n", encode(bytes))
     local ok, err = self.conn:write(bytes, mkcb(self, "on_write"))
     if not ok then
         -- not recoverable
@@ -625,15 +624,15 @@ function SocketTransport:send_bytes(bytes) --> nil
 end
 
 function SocketTransport:on_write(err) --> nil
-    log_printf("SocketTransport:on_write(%s)\n", err)
+    -- log_printf("SocketTransport:on_write(%s)\n", err)
     if self.want_reset or not err then return end
     nvim_printf("write failed, reconnecting...")
-    log_printf("write failed, reconnecting...\n")
+    -- log_printf("write failed, reconnecting...\n")
     self:close_and_reset()
 end
 
 function SocketTransport:on_connect(err) --> nil
-    log_printf("on_connect! err=%s\n", err)
+    -- log_printf("on_connect! err=%s\n", err)
     self.connect.returned = true
     self.connect.success = err == nil
     self:advance_state()
@@ -651,7 +650,7 @@ function SocketTransport:on_backoff_timer() --> nil
 end
 
 function SocketTransport:close_and_reset() --> nil
-    log_printf("close_and_reset!\n")
+    -- log_printf("close_and_reset!\n")
     self.want_reset = true
     self.conn:close(mkcb(self, "on_close_for_reset"))
 end
@@ -665,17 +664,17 @@ function SocketTransport:on_read(err, chunk) --> nil
     if self.want_reset then return end
     if err then
         nvim_printf("read failed (%s), reconnecting...", err)
-        log_printf("read failed (%s), reconnecting...\n", err)
+        -- log_printf("read failed (%s), reconnecting...\n", err)
         self:close_and_reset()
         return
     end
     if not chunk then
         nvim_printf("unexpected eof, reconnecting...")
-        log_printf("unexpected eof, reconnecting...\n")
+        -- log_printf("unexpected eof, reconnecting...\n")
         self:close_and_reset()
         return
     end
-    log_printf("SocketTransport read: %s\n", encode(chunk))
+    -- log_printf("SocketTransport read: %s\n", encode(chunk))
     t = split_soft(self.leftovers .. chunk, "\n")
     for i = 1, #t-1 do
         table.insert(self.read_q, t[i])
@@ -716,6 +715,8 @@ function Client:create(addrspec, vim) --> Client
     setmetatable(self, Client)
 
     self.vim = vim
+
+    self.bt = breaktree.BreakTree.create()
 
     self.transport = SocketTransport:create(
         addrspec, mkcb(self, "on_connect"), mkcb(self, "on_msg")
@@ -768,7 +769,10 @@ end
 -- must only execute within vim-safe callbacks
 function Client:advance_state() --> nil
     if not self.first_sync then
-        vim.api.nvim_buf_set_lines(
+        -- configure our breaktree
+        self.bt:insert_text(0, self.text)
+        -- configure the vim buffer
+        self.vim.api.nvim_buf_set_lines(
             0,    -- current buffer
             0,    -- first line
             -1,   -- to last line
@@ -798,14 +802,17 @@ end
 -- vim-safe callback
 function Client:on_insert(idx, text) --> nil
     if not self.first_sync then return end
+    self.bt:insert_text(idx, text)
     local msg = self:make_edit(NewInsert(idx, text))
     self.transport:write(msg)
 end
 
 -- vim-safe callback
-function Client:on_delete(idx, nchars, text) --> nil
+function Client:on_delete(idx, nchars) --> nil
     if not self.first_sync then return end
-    local s = self:make_edit(NewDelete(idx, nchars, text))
+    text = c.bt:delete_text(idx, nchars)
+    log_printf("deleted: %s\n", encode(text))
+    local msg = self:make_edit(NewDelete(idx, nchars, text))
     self.transport:write(msg)
 end
 
@@ -813,7 +820,6 @@ end
 if vim then
     -- plugin execution, against the real vim
     c = Client:create("./asdf", vim)
-    bt = breaktree.BreakTree.create()
 
     -- truncate log file
     f = io.open("log", "w")
@@ -825,8 +831,7 @@ if vim then
         -- broadcast operational transforms to the server
         -- important args are s (start), ol (old len), and nl (new len)
         if ol > 0 then
-            -- XXX find deleted chars too
-            c:on_delete(s, ol, nil)
+            c:on_delete(s, ol)
         end
         if nl > 0 then
             -- emit an insertion
@@ -853,6 +858,7 @@ else
         NewInsert = NewInsert,
         NewDelete = NewDelete,
         NewSubmission = NewSubmission,
+        NewAcknowledge = NewAcknowledge,
         NewExternal = NewExternal,
         NewAccept = NewAccept,
         apply = apply,

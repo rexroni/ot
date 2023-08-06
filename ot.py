@@ -3,6 +3,7 @@ import contextlib
 import collections
 import os
 import traceback
+import random
 
 import trio
 from trio import socket
@@ -934,6 +935,9 @@ class SocketTransport:
         self.edit_server = None
         # map connections to writable channel ends
         self.chans = {}
+        self.next_author = 1
+        # map author ids to reconnection secrets
+        self.secrets = {}
 
     def set_edit_server(self, edit_server):
         assert self.edit_server is None, "edit_server is already set!"
@@ -951,8 +955,7 @@ class SocketTransport:
     async def acceptor(self, sock):
         while True:
             conn, _ = await sock.accept()
-            with open("log", "a") as f:
-                f.write(f"py | accepted connection\n")
+            log("accepted connection")
             self.nursery.start_soon(self.run_connection, conn)
 
     async def run_connection(self, conn):
@@ -961,8 +964,7 @@ class SocketTransport:
             buf = b""
             while b"\n" not in buf:
                 byts = await conn.recv(4096)
-                with open("log", "a") as f:
-                    f.write(f"py | negotiator read: {byts}\n")
+                log(f"negotiator read: {byts}")
                 if not byts:
                     print("connection broke before negotiation finished")
                     return
@@ -972,14 +974,16 @@ class SocketTransport:
             cmd, rest = line.split(b":", maxsplit=1)
             if cmd == b"new":
                 name = rest
-                print(f"new connection from {name}")
+                author = self.next_author
+                self.next_author += 1
+                # TODO: better source of randomness for secrets
+                secret = random.randbytes(32)
+                self.secrets[author] = secret
+                print(f"new connection from {name} as author={author}")
                 text = encode_text(self.edit_server.text)
-                # XXX: real author id
-                # XXX: real reconnection secret
                 latest_seq = self.edit_server.edits[-1].id.seq
-                msg = b"%d:%s:%d:%s\n"%(1, b"secret", latest_seq, text)
-                with open("log", "a") as f:
-                    f.write(f"py | negotiator writing: {msg}\n")
+                msg = b"%d:%s:%d:%s\n"%(author, secret, latest_seq, text)
+                log(f"negotiator writing: {msg}")
                 await conn.send(msg)
             else:
                 raise ValueError(f"non-new negotiation detected: {line}")
@@ -987,7 +991,7 @@ class SocketTransport:
             # start full-duplex OT streaming
             w, r = trio.open_memory_channel(10)
             self.chans[conn] = w
-            await self.edit_server.on_connect(conn)
+            await self.edit_server.on_connect(conn, author)
             try:
                 with trio.CancelScope() as cancel_conn:
                     cancel = cancel_conn.cancel
@@ -1006,10 +1010,8 @@ class SocketTransport:
                 # server is guaranteed to be done with this chan
                 del self.chans[conn]
         except Exception as e:
-            with open("log", "a") as f:
-                f.write(f"py | connection failed: {e}\n")
+            log(f"connection failed: {e}")
             traceback.format_exc()
-            raise
         finally:
             conn.close()
 
@@ -1033,10 +1035,10 @@ class SocketTransport:
         try:
             while True:
                 byts = await conn.recv(4096)
-                # TODO: error handling, maybe like proxy.py::handle_conn()
-                with open("log", "a") as f:
-                    f.write(f"py | read bytes: {byts}\n")
-                assert byts, byts
+                if not byts:
+                    log("eof")
+                    return
+                log(f"read bytes: {byts}")
                 await self.edit_server.on_read(conn, byts)
         finally:
             cancel_fn()
@@ -1188,6 +1190,8 @@ class EditServer:
         self.conns = set()
         # keyed by conn
         self.defraggers = {}
+        # also keyed by conn
+        self.authors = {}
         # index matches server's edit id
         self.edits = []
 
@@ -1209,7 +1213,7 @@ class EditServer:
             first_edit = Edit(first_ot, first_id, base_id)
             self.edits.append(first_edit)
 
-    async def on_connect(self, conn):
+    async def on_connect(self, conn, author):
         # Make a defrag function to form lines from packets.
         buf = b""
 
@@ -1224,6 +1228,7 @@ class EditServer:
         self.conns.add(conn)
         self.defraggers[conn] = defrag
         self.shadows[conn] = Shadow(self.edits[-1].id)
+        self.authors[conn] = author
 
     async def on_disconnect(self, conn):
         # sync our disconnection with the queue
@@ -1231,25 +1236,25 @@ class EditServer:
         self.conns.remove(conn)
         del self.defraggers[conn]
         del self.shadows[conn]
+        del self.authors[conn]
 
     async def on_read(self, conn, byts):
         lines = self.defraggers[conn](byts)
+        author = self.authors[conn]
 
         for line in lines:
             typ, body = line.split(b":", maxsplit=1)
             if typ == b"s":  # edit submission
-                # XXX: real author
-                edit = Edit.from_line(body, 1)
+                edit = Edit.from_line(body, author)
                 # verify that the parent edit is sane
                 if edit.parent.author == 0:
-                    # based on server history, must be based on a server
-                    # history newer than this
+                    # based on server history
                     if edit.parent.seq >= len(self.edits):
                         raise ValueError(
-                            f"author {XXX} submitted edit based on "
+                            f"author {author} submitted edit based on "
                             "non-existent parent submission"
                         )
-                elif edit.parent.author == 1:  # XXX real author id
+                elif edit.parent.author == author:
                     # based on a previous submission, must be the latest one
                     shadow = self.shadows[conn]
                     valid = None
@@ -1257,7 +1262,7 @@ class EditServer:
                         valid = shadow.submissions[-1].id.seq
                     if not shadow.dirty and edit.parent.seq != valid:
                         raise ValueError(
-                            f"author {XXX} submitted edit based on invalid "
+                            f"author {author} submitted edit based on invalid "
                             "parent submission (not the most recent one)"
                         )
                 else:
@@ -1275,7 +1280,7 @@ class EditServer:
 
     def submission_atomic(self, conn, edit):
         # "atomic" because no other coroutines may run during this function
-        # returns False if submission was rejected or came to nothing
+        # returns None if submission was rejected or came to nothing
         if edit.parent.author == 0:
             # start a new shadow history
             shadow = Shadow(edit.parent)
@@ -1301,6 +1306,11 @@ class EditServer:
             )
         )
         self.text = ot.apply(self.text)
+        if True:
+            rendered = b"text is now:\n------\n" + self.text + b"------"
+            with open("log", "ab") as f:
+                rendered = b"\n".join(b"py | " + l for l in rendered.split(b"\n"))
+                f.write(rendered + b"\n")
         return new_seq, ot
 
     async def on_submission(self, conn, edit):
