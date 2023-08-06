@@ -175,26 +175,49 @@ local function addrspec_connect(addrspec, on_connect) --> (conn|nil, err)
     error("addrspec must be port, host:port, or a path")
 end
 
+-- Classes of ot.lua:
+--
+--   OT: Union[Insert, Delete]
+--
+--   - Insert: {class="i", idx:int, text:string}
+--
+--   - Delete: {class="d", idx:int, nchars:int, text:string|nil}
+--
+--   ClientMessage: Union[Submisison, Acknowledge]
+--
+--   - Submission: {class="s", seq:int, parent_seq:int, parent_id:int, ot:OT}
+--
+--   - Acknowledge: {class="k", seq:int}
+--
+--   ServerMessage: Union[External, Accept]
+--
+--   - External: {class="x", seq:int, ot:OT}
+--
+--   - Accept: {class="a", seq:int}
 
-local function NewInsert(idx, text) --> table
+local function NewInsert(idx, text)
     return {class="i", idx=idx, text=text}
 end
 
-local function NewDelete(idx, nchars, text) --> table, text may be nil
+local function NewDelete(idx, nchars, text) -- text may be nil
     return {class="d", idx=idx, nchars=nchars, text=text}
 end
 
-local function NewSubmission(seq, parent_seq, parent_id, ot) --> table
+local function NewSubmission(seq, parent_seq, parent_id, ot)
     return {
         class="s", seq=seq, parent_seq=parent_seq, parent_id=parent_id, ot=ot
     }
+end
+
+local function NewAcknowledge(seq)
+    return {class="k", seq=seq}
 end
 
 local function NewExternal(seq, ot) --> table, ot is either an Insert or Delete
     return {class="x", seq=seq, ot=ot}
 end
 
-local function NewAccept(seq) --> table
+local function NewAccept(seq)
     return {class="a", seq=seq}
 end
 
